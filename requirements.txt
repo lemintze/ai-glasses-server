@@ -3,5 +3,5 @@ openai
 supabase
 ultralytics
 requests
-pillow
 gunicorn
+uuid
