@@ -1,0 +1,7 @@
+flask
+openai
+supabase
+ultralytics
+requests
+pillow
+gunicorn
