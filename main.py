@@ -1,29 +1,29 @@
 import os
+import io
 import base64
 import uuid
 import requests
 from flask import Flask, request, jsonify
 from openai import OpenAI
-from supabase import create_client
+from ultralytics import YOLO
 
 app = Flask(__name__)
 
-# ==========================
-# 读取环境变量
-# ==========================
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# 初始化客户端
 client = OpenAI(api_key=OPENAI_API_KEY)
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# 使用更省内存的模型
+model = YOLO("yolov5n.pt")
 
-# ==========================
-# 上传音频到 Supabase
-# ==========================
-def upload_audio(audio_content, filename):
+DANGER_CLASSES = ["person", "car", "bus", "truck"]
+
+# 上传音频
+def upload_audio(audio_content):
+
+    filename = f"{uuid.uuid4()}.mp3"
 
     headers = {
         "apikey": SUPABASE_KEY,
@@ -42,150 +42,115 @@ def upload_audio(audio_content, filename):
 
 
 # ==========================
-# 接口1：安全识别
+# 危险检测接口
 # ==========================
 @app.route("/detect", methods=["POST"])
 def detect():
 
-    try:
+    img_bytes = request.get_data()
 
-        img_bytes = request.get_data()
+    if not img_bytes:
+        return jsonify({"danger": False, "text": "", "audio_url": ""})
 
-        if not img_bytes:
-            return jsonify({"error": "No image"}), 400
+    results = model(io.BytesIO(img_bytes))
 
-        base64_image = base64.b64encode(img_bytes).decode("utf-8")
+    danger = False
+    warning_text = ""
 
-        # 使用 GPT4o Vision
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "请判断图片中是否存在危险（例如车辆靠近、行人、公交车等），只用一句话回答。"
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }
-                        }
-                    ]
-                }
-            ]
-        )
+    for r in results:
 
-        result = response.choices[0].message.content
+        for box in r.boxes:
 
-        # 简单危险判断
-        danger = False
+            cls_id = int(box.cls[0])
+            class_name = model.names[cls_id]
+            conf = float(box.conf[0])
 
-        if "车" in result or "危险" in result or "行人" in result:
-            danger = True
+            if conf > 0.5 and class_name in DANGER_CLASSES:
 
-        audio_url = ""
+                danger = True
 
-        if danger:
+                if class_name == "car":
+                    warning_text = "Achtung, ein Auto nähert sich."
 
-            speech = client.audio.speech.create(
-                model="tts-1",
-                voice="alloy",
-                input=result
-            )
+                elif class_name == "bus":
+                    warning_text = "Achtung, ein Bus kommt."
 
-            filename = f"{uuid.uuid4()}.mp3"
+                elif class_name == "truck":
+                    warning_text = "Achtung, ein Lastwagen nähert sich."
 
-            audio_url = upload_audio(speech.content, filename)
+                elif class_name == "person":
+                    warning_text = "Person vor Ihnen, bitte vorsichtig gehen."
 
-        return jsonify({
-            "danger": danger,
-            "text": result,
-            "audio_url": audio_url
-        })
+                break
 
-    except Exception as e:
+    audio_url = ""
 
-        return jsonify({
-            "danger": False,
-            "text": str(e),
-            "audio_url": ""
-        })
-
-
-# ==========================
-# 接口2：AI助手
-# ==========================
-@app.route("/ask_ai", methods=["POST"])
-def ask_ai():
-
-    try:
-
-        img_bytes = request.get_data()
-
-        if not img_bytes:
-            return jsonify({"error": "No image"}), 400
-
-        base64_image = base64.b64encode(img_bytes).decode("utf-8")
-
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "描述图片环境。"
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }
-                        }
-                    ]
-                }
-            ]
-        )
-
-        result = response.choices[0].message.content
+    if danger:
 
         speech = client.audio.speech.create(
             model="tts-1",
             voice="alloy",
-            input=result
+            input=warning_text
         )
 
-        filename = f"{uuid.uuid4()}.mp3"
+        audio_url = upload_audio(speech.content)
 
-        audio_url = upload_audio(speech.content, filename)
-
-        return jsonify({
-            "text": result,
-            "audio_url": audio_url
-        })
-
-    except Exception as e:
-
-        return jsonify({
-            "text": str(e),
-            "audio_url": ""
-        })
+    return jsonify({
+        "danger": danger,
+        "text": warning_text,
+        "audio_url": audio_url
+    })
 
 
 # ==========================
-# 测试接口
+# 视觉助手（按钮触发）
 # ==========================
+@app.route("/ask_ai", methods=["POST"])
+def ask_ai():
+
+    img_bytes = request.get_data()
+
+    base64_image = base64.b64encode(img_bytes).decode("utf-8")
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Beschreibe kurz die Umgebung für eine blinde Person."
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{base64_image}"
+                    }
+                }
+            ]
+        }]
+    )
+
+    text = response.choices[0].message.content
+
+    speech = client.audio.speech.create(
+        model="tts-1",
+        voice="alloy",
+        input=text
+    )
+
+    audio_url = upload_audio(speech.content)
+
+    return jsonify({
+        "text": text,
+        "audio_url": audio_url
+    })
+
+
 @app.route("/test")
 def test():
-    return jsonify({"status": "server running"})
+    return {"status": "server running"}
 
 
-# ==========================
-# 启动
-# ==========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
