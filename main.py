@@ -41,7 +41,6 @@ def upload_audio_to_supabase(audio_content, filename):
         resp = requests.put(upload_url, data=audio_content, headers=headers)
         
         if resp.status_code == 200:
-            # 返回公开访问 URL
             return f"{SUPABASE_URL}/storage/v1/object/public/ai-files/tts/{filename}"
         else:
             print(f"上传失败：{resp.text}")
@@ -55,11 +54,16 @@ def upload_audio_to_supabase(audio_content, filename):
 # ===========================
 @app.route('/detect', methods=['POST'])
 def detect_safety():
-    if 'file' not in request.files:
-        return jsonify({"error": "No image"}), 400
+    # ✅ 兼容两种格式：form-data 或 原始图片
+    if 'file' in request.files:
+        file = request.files['file']
+        img_bytes = file.read()
+    else:
+        # ESP32 发送的原始图片数据
+        img_bytes = request.get_data()
     
-    file = request.files['file']
-    img_bytes = file.read()
+    if not img_bytes:
+        return jsonify({"error": "No image"}), 400
     
     # 1. YOLO 识别
     results = model(io.BytesIO(img_bytes))
@@ -92,18 +96,15 @@ def detect_safety():
     # 2. 生成 TTS 语音
     audio_url = ""
     if danger_found and warning_msg:
-        # 调用 OpenAI TTS
         speech_response = client.audio.speech.create(
             model="tts-1", 
             voice="alloy", 
             input=warning_msg
         )
         
-        # 上传到 Supabase
         filename = f"{uuid.uuid4()}.mp3"
         audio_url = upload_audio_to_supabase(speech_response.content, filename)
         
-        # 记录日志
         try:
             supabase.table("logs").insert({
                 "type": "danger",
@@ -125,16 +126,18 @@ def detect_safety():
 # ===========================
 @app.route('/ask_ai', methods=['POST'])
 def ask_ai_vision():
-    if 'file' not in request.files:
+    # ✅ 兼容两种格式：form-data 或 原始图片
+    if 'file' in request.files:
+        file = request.files['file']
+        img_bytes = file.read()
+    else:
+        img_bytes = request.get_data()
+    
+    if not img_bytes:
         return jsonify({"error": "No image"}), 400
     
-    file = request.files['file']
-    img_bytes = file.read()
-    
-    # 转 base64
     base64_image = base64.b64encode(img_bytes).decode('utf-8')
     
-    # 1. 调用 GPT-4o 视觉模型
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
@@ -149,14 +152,12 @@ def ask_ai_vision():
         
         ai_text = response.choices[0].message.content
         
-        # 2. 生成 TTS 语音
         speech_response = client.audio.speech.create(
             model="tts-1", 
             voice="alloy", 
             input=ai_text
         )
         
-        # 上传到 Supabase
         filename = f"{uuid.uuid4()}.mp3"
         audio_url = upload_audio_to_supabase(speech_response.content, filename)
         
