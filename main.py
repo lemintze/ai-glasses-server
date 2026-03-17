@@ -1,5 +1,4 @@
 import os
-import io
 import cv2
 import uuid
 import base64
@@ -22,7 +21,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 MODEL_PATH = "yolov5n.onnx"
 net = cv2.dnn.readNetFromONNX(MODEL_PATH)
 
-# 只保留你需要的危险类别
+# 只保留危险类别
 DANGER_CLASS_MAP = {
     0: "person",
     2: "car",
@@ -62,7 +61,7 @@ def upload_audio(audio_content):
 # 图片预处理
 # ==========================
 def letterbox(image, new_shape=(640, 640), color=(114, 114, 114)):
-    shape = image.shape[:2]  # (h, w)
+    shape = image.shape[:2]
 
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
     new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
@@ -107,8 +106,6 @@ def detect_objects(image):
 
     net.setInput(blob)
     outputs = net.forward()
-
-    # 常见输出形状: (1, 25200, 85)
     predictions = outputs[0]
 
     boxes = []
@@ -168,7 +165,7 @@ def detect_objects(image):
 
 
 # ==========================
-# 危险检测接口
+# 自动危险检测
 # ==========================
 @app.route("/detect", methods=["POST"])
 def detect():
@@ -204,17 +201,14 @@ def detect():
                 danger = True
                 warning_text = "Achtung, ein Auto nähert sich."
                 break
-
             elif class_name == "bus":
                 danger = True
                 warning_text = "Achtung, ein Bus kommt."
                 break
-
             elif class_name == "truck":
                 danger = True
                 warning_text = "Achtung, ein Lastwagen nähert sich."
                 break
-
             elif class_name == "person":
                 danger = True
                 warning_text = "Person vor Ihnen, bitte vorsichtig gehen."
@@ -245,24 +239,12 @@ def detect():
 
 
 # ==========================
-# AI 视觉助手
+# 按钮触发 AI 场景描述
 # ==========================
 @app.route("/ask_ai", methods=["POST"])
 def ask_ai():
     try:
-        # 前：只收图片
-        # 后：同时收图片和音频
-        if "image" not in request.files or "audio" not in request.files:
-            return jsonify({
-                "text": "Bild oder Audio fehlt.",
-                "audio_url": ""
-            }), 400
-
-        image_file = request.files["image"]
-        audio_file = request.files["audio"]
-
-        img_bytes = image_file.read()
-        audio_bytes = audio_file.read()
+        img_bytes = request.get_data()
 
         if not img_bytes:
             return jsonify({
@@ -270,47 +252,21 @@ def ask_ai():
                 "audio_url": ""
             }), 400
 
-        if not audio_bytes:
-            return jsonify({
-                "text": "Kein Audio empfangen.",
-                "audio_url": ""
-            }), 400
-
-        # ==========================
-        # 1. 语音转文字
-        # ==========================
-        with open("temp_question.wav", "wb") as f:
-            f.write(audio_bytes)
-
-        with open("temp_question.wav", "rb") as f:
-            transcript = client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=f
-            )
-
-        user_question = transcript.text
-
-        # ==========================
-        # 2. 图片转 base64
-        # ==========================
         base64_image = base64.b64encode(img_bytes).decode("utf-8")
 
-        # ==========================
-        # 3. 把“用户问题 + 图片”一起交给 GPT
-        # ==========================
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
-                    "content": "Du bist ein hilfreicher Assistent für blinde Nutzer. Antworte kurz, klar und direkt auf Deutsch."
+                    "content": "Du bist ein hilfreicher Assistent für blinde Nutzer. Beschreibe die aktuelle Umgebung kurz, klar, praktisch und auf Deutsch."
                 },
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "text",
-                            "text": f"Die Nutzerfrage lautet: {user_question}"
+                            "text": "Beschreibe bitte die aktuelle Szene kurz und hilfreich."
                         },
                         {
                             "type": "image_url",
@@ -323,26 +279,18 @@ def ask_ai():
             ]
         )
 
-        answer_text = response.choices[0].message.content
+        text = response.choices[0].message.content
 
-        # ==========================
-        # 4. 回答转语音
-        # ==========================
         speech = client.audio.speech.create(
             model="tts-1",
             voice="alloy",
-            input=answer_text
+            input=text
         )
 
         audio_url = upload_audio(speech.content)
 
-        # 删除临时文件
-        if os.path.exists("temp_question.wav"):
-            os.remove("temp_question.wav")
-
         return jsonify({
-            "question": user_question,
-            "text": answer_text,
+            "text": text,
             "audio_url": audio_url
         })
 
