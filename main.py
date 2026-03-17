@@ -108,43 +108,58 @@ def detect():
 @app.route("/ask_ai", methods=["POST"])
 def ask_ai():
 
-    img_bytes = request.get_data()
+    try:
 
-    base64_image = base64.b64encode(img_bytes).decode("utf-8")
+        img_bytes = request.get_data()
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "Beschreibe kurz die Umgebung für eine blinde Person."
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{base64_image}"
+        if not img_bytes:
+            return jsonify({
+                "text": "Kein Bild empfangen",
+                "audio_url": ""
+            })
+
+        base64_image = base64.b64encode(img_bytes).decode("utf-8")
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Beschreibe kurz die Umgebung für eine blinde Person."
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
                     }
-                }
-            ]
-        }]
-    )
+                ]
+            }]
+        )
 
-    text = response.choices[0].message.content
+        text = response.choices[0].message.content
 
-    speech = client.audio.speech.create(
-        model="tts-1",
-        voice="alloy",
-        input=text
-    )
+        speech = client.audio.speech.create(
+            model="tts-1",
+            voice="alloy",
+            input=text
+        )
 
-    audio_url = upload_audio(speech.content)
+        audio_url = upload_audio(speech.content)
 
-    return jsonify({
-        "text": text,
-        "audio_url": audio_url
-    })
+        return jsonify({
+            "text": text,
+            "audio_url": audio_url
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "text": str(e),
+            "audio_url": ""
+        })
 
 
 @app.route("/test")
