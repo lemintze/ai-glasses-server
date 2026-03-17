@@ -1,8 +1,6 @@
 flask
 openai
-supabase
 requests
-pillow
 gunicorn
+numpy
 opencv-python-headless
-onnxruntime
