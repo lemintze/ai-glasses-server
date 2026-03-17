@@ -1,7 +1,8 @@
 flask
 openai
 supabase
-ultralytics
 requests
+pillow
 gunicorn
-uuid
+opencv-python-headless
+onnxruntime
