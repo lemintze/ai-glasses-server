@@ -249,25 +249,67 @@ def detect():
 @app.route("/ask_ai", methods=["POST"])
 def ask_ai():
     try:
-        img_bytes = request.get_data()
+        # 前：只收图片
+        # 后：同时收图片和音频
+        if "image" not in request.files or "audio" not in request.files:
+            return jsonify({
+                "text": "Bild oder Audio fehlt.",
+                "audio_url": ""
+            }), 400
+
+        image_file = request.files["image"]
+        audio_file = request.files["audio"]
+
+        img_bytes = image_file.read()
+        audio_bytes = audio_file.read()
 
         if not img_bytes:
             return jsonify({
                 "text": "Kein Bild empfangen.",
                 "audio_url": ""
-            })
+            }), 400
 
+        if not audio_bytes:
+            return jsonify({
+                "text": "Kein Audio empfangen.",
+                "audio_url": ""
+            }), 400
+
+        # ==========================
+        # 1. 语音转文字
+        # ==========================
+        with open("temp_question.wav", "wb") as f:
+            f.write(audio_bytes)
+
+        with open("temp_question.wav", "rb") as f:
+            transcript = client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=f
+            )
+
+        user_question = transcript.text
+
+        # ==========================
+        # 2. 图片转 base64
+        # ==========================
         base64_image = base64.b64encode(img_bytes).decode("utf-8")
 
+        # ==========================
+        # 3. 把“用户问题 + 图片”一起交给 GPT
+        # ==========================
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
+                {
+                    "role": "system",
+                    "content": "Du bist ein hilfreicher Assistent für blinde Nutzer. Antworte kurz, klar und direkt auf Deutsch."
+                },
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "text",
-                            "text": "Du bist ein Assistent für blinde Nutzer. Beschreibe kurz und klar die Umgebung auf Deutsch."
+                            "text": f"Die Nutzerfrage lautet: {user_question}"
                         },
                         {
                             "type": "image_url",
@@ -280,18 +322,26 @@ def ask_ai():
             ]
         )
 
-        text = response.choices[0].message.content
+        answer_text = response.choices[0].message.content
 
+        # ==========================
+        # 4. 回答转语音
+        # ==========================
         speech = client.audio.speech.create(
             model="tts-1",
             voice="alloy",
-            input=text
+            input=answer_text
         )
 
         audio_url = upload_audio(speech.content)
 
+        # 删除临时文件
+        if os.path.exists("temp_question.wav"):
+            os.remove("temp_question.wav")
+
         return jsonify({
-            "text": text,
+            "question": user_question,
+            "text": answer_text,
             "audio_url": audio_url
         })
 
