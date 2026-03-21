@@ -48,11 +48,13 @@ def upload_audio(audio_content):
     }
 
     upload_url = f"{SUPABASE_URL}/storage/v1/object/ai-files/tts/{filename}"
-    r = requests.put(upload_url, data=audio_content, headers=headers)
+    r = requests.put(upload_url, data=audio_content, headers=headers, timeout=30)
 
-    # 这里改一下，兼容 200 / 201
+    # Supabase 这里可能返回 200 或 201
     if r.status_code in [200, 201]:
-        return f"{SUPABASE_URL}/storage/v1/object/public/ai-files/tts/{filename}"
+        public_url = f"{SUPABASE_URL}/storage/v1/object/public/ai-files/tts/{filename}"
+        print("Supabase upload success:", public_url)
+        return public_url
 
     print("Supabase upload failed:", r.status_code, r.text)
     return ""
@@ -195,7 +197,6 @@ def detect():
         danger = False
         warning_text = ""
 
-        # 只要检测到这几类才播报
         for det in detections:
             class_name = det["class_name"]
 
@@ -213,7 +214,7 @@ def detect():
                 break
             elif class_name == "person":
                 danger = True
-                warning_text = "Vorsicht, vor Ihnen ist eine Person."
+                warning_text = "Person vor Ihnen, bitte vorsichtig gehen."
                 break
 
         audio_url = ""
@@ -224,7 +225,13 @@ def detect():
                 voice="alloy",
                 input=warning_text
             )
+
+            # 调试日志
+            print("[detect] warning_text =", warning_text)
+            print("[detect] tts bytes =", len(speech.content) if speech and speech.content else 0)
+
             audio_url = upload_audio(speech.content)
+            print("[detect] audio_url =", audio_url)
 
         return jsonify({
             "danger": danger,
@@ -233,6 +240,7 @@ def detect():
         })
 
     except Exception as e:
+        print("[detect] error:", str(e))
         return jsonify({
             "danger": False,
             "text": str(e),
@@ -261,7 +269,10 @@ def ask_ai():
             messages=[
                 {
                     "role": "system",
-                    "content": "Du bist ein hilfreicher Assistent für blinde Nutzer. Beschreibe die aktuelle Umgebung kurz, klar, praktisch und auf Deutsch."
+                    "content": (
+                        "Du bist ein hilfreicher Assistent für blinde Nutzer. "
+                        "Beschreibe die aktuelle Umgebung kurz, klar, praktisch und auf Deutsch."
+                    )
                 },
                 {
                     "role": "user",
@@ -284,14 +295,19 @@ def ask_ai():
         text = response.choices[0].message.content.strip()
         audio_url = ""
 
-        # 只有按钮触发时，才把 AI 内容转成 TTS
         if text:
             speech = client.audio.speech.create(
                 model="tts-1",
                 voice="alloy",
                 input=text
             )
+
+            # 调试日志
+            print("[ask_ai] text =", text)
+            print("[ask_ai] tts bytes =", len(speech.content) if speech and speech.content else 0)
+
             audio_url = upload_audio(speech.content)
+            print("[ask_ai] audio_url =", audio_url)
 
         return jsonify({
             "text": text,
@@ -299,6 +315,7 @@ def ask_ai():
         })
 
     except Exception as e:
+        print("[ask_ai] error:", str(e))
         return jsonify({
             "text": str(e),
             "audio_url": ""
