@@ -50,7 +50,8 @@ def upload_audio(audio_content):
     upload_url = f"{SUPABASE_URL}/storage/v1/object/ai-files/tts/{filename}"
     r = requests.put(upload_url, data=audio_content, headers=headers)
 
-    if r.status_code == 200:
+    # 这里改一下，兼容 200 / 201
+    if r.status_code in [200, 201]:
         return f"{SUPABASE_URL}/storage/v1/object/public/ai-files/tts/{filename}"
 
     print("Supabase upload failed:", r.status_code, r.text)
@@ -194,6 +195,7 @@ def detect():
         danger = False
         warning_text = ""
 
+        # 只要检测到这几类才播报
         for det in detections:
             class_name = det["class_name"]
 
@@ -211,12 +213,12 @@ def detect():
                 break
             elif class_name == "person":
                 danger = True
-                warning_text = "Person vor Ihnen, bitte vorsichtig gehen."
+                warning_text = "Vorsicht, vor Ihnen ist eine Person."
                 break
 
         audio_url = ""
 
-        if danger and warning_text:
+        if danger and warning_text.strip():
             speech = client.audio.speech.create(
                 model="tts-1",
                 voice="alloy",
@@ -279,15 +281,17 @@ def ask_ai():
             ]
         )
 
-        text = response.choices[0].message.content
+        text = response.choices[0].message.content.strip()
+        audio_url = ""
 
-        speech = client.audio.speech.create(
-            model="tts-1",
-            voice="alloy",
-            input=text
-        )
-
-        audio_url = upload_audio(speech.content)
+        # 只有按钮触发时，才把 AI 内容转成 TTS
+        if text:
+            speech = client.audio.speech.create(
+                model="tts-1",
+                voice="alloy",
+                input=text
+            )
+            audio_url = upload_audio(speech.content)
 
         return jsonify({
             "text": text,
@@ -300,9 +304,6 @@ def ask_ai():
             "audio_url": ""
         }), 500
 
-@app.route("/", methods=["GET", "HEAD"])
-def home():
-    return jsonify({"status": "ok"})
 
 # ==========================
 # 测试接口
@@ -313,5 +314,4 @@ def test():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
