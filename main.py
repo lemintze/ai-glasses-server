@@ -238,7 +238,7 @@ def detect():
             speech = client.audio.speech.create(
                 model="tts-1",
                 voice="alloy",
-                input=warning_text
+                input=warning_text,
                 speed=1.5
             )
 
@@ -319,7 +319,7 @@ def ask_ai():
             speech = client.audio.speech.create(
                 model="tts-1",
                 voice="alloy",
-                input=text
+                input=text,
                 speed=1.5
             )
 
