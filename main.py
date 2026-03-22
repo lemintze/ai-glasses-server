@@ -50,7 +50,6 @@ def upload_audio(audio_content):
     upload_url = f"{SUPABASE_URL}/storage/v1/object/ai-files/tts/{filename}"
     r = requests.put(upload_url, data=audio_content, headers=headers, timeout=30)
 
-    # Supabase 这里可能返回 200 或 201
     if r.status_code in [200, 201]:
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/ai-files/tts/{filename}"
         print("Supabase upload success:", public_url)
@@ -168,7 +167,7 @@ def detect_objects(image):
 
 
 # ==========================
-# 自动危险检测
+# 自动危险检测（带距离判断）
 # ==========================
 @app.route("/detect", methods=["POST"])
 def detect():
@@ -192,6 +191,9 @@ def detect():
                 "audio_url": ""
             })
 
+        # ✅ 获取图像尺寸（用于距离判断）
+        img_height, img_width = image.shape[:2]
+
         detections = detect_objects(image)
 
         danger = False
@@ -199,23 +201,36 @@ def detect():
 
         for det in detections:
             class_name = det["class_name"]
-
-            if class_name == "car":
-                danger = True
-                warning_text = "Achtung, ein Auto nähert sich."
-                break
-            elif class_name == "bus":
-                danger = True
-                warning_text = "Achtung, ein Bus kommt."
-                break
-            elif class_name == "truck":
-                danger = True
-                warning_text = "Achtung, ein Lastwagen nähert sich."
-                break
-            elif class_name == "person":
-                danger = True
-                warning_text = "Person vor Ihnen, bitte vorsichtig gehen."
-                break
+            box = det["box"]  # [x, y, w, h]
+            
+            # ✅ 计算 bounding box 面积和位置
+            box_area = box[2] * box[3]  # w * h
+            box_center_y = box[1] + box[3] / 2  # y + h/2
+            
+            # 计算相对大小和位置
+            area_ratio = box_area / (img_width * img_height)
+            position_ratio = box_center_y / img_height
+            
+            # ✅ 距离判断：物体足够大 且 在画面下方 = 够近
+            if area_ratio > 0.08 and position_ratio > 0.5:
+                if class_name == "car":
+                    danger = True
+                    warning_text = "Achtung, ein Auto nähert sich."
+                    break
+                elif class_name == "bus":
+                    danger = True
+                    warning_text = "Achtung, ein Bus kommt."
+                    break
+                elif class_name == "truck":
+                    danger = True
+                    warning_text = "Achtung, ein Lastwagen nähert sich."
+                    break
+                elif class_name == "person":
+                    danger = True
+                    warning_text = "Person vor Ihnen, bitte vorsichtig gehen."
+                    break
+            else:
+                print(f"⚠️ {class_name} 距离较远 (area={area_ratio:.3f}, pos={position_ratio:.3f})，不播报")
 
         audio_url = ""
 
@@ -226,7 +241,6 @@ def detect():
                 input=warning_text
             )
 
-            # 调试日志
             print("[detect] warning_text =", warning_text)
             print("[detect] tts bytes =", len(speech.content) if speech and speech.content else 0)
 
@@ -271,7 +285,12 @@ def ask_ai():
                     "role": "system",
                     "content": (
                         "Du bist ein hilfreicher Assistent für blinde Nutzer. "
-                        "Beschreibe die aktuelle Umgebung kurz, klar, praktisch und auf Deutsch."
+                        "REGELN: "
+                        "1. Maximal 1-2 Sätze (unter 30 Wörtern). "
+                        "2. Nur wichtige Informationen: Objekte, Personen, Gefahren, Hindernisse. "
+                        "3. Keine Füllwörter wie 'ich sehe', 'es gibt', 'auf dem Bild'. "
+                        "4. Direkt und praktisch. "
+                        "5. Auf Deutsch."
                     )
                 },
                 {
@@ -302,7 +321,6 @@ def ask_ai():
                 input=text
             )
 
-            # 调试日志
             print("[ask_ai] text =", text)
             print("[ask_ai] tts bytes =", len(speech.content) if speech and speech.content else 0)
 
