@@ -2,6 +2,8 @@ import os
 import cv2
 import uuid
 import base64
+import wave
+import io
 import numpy as np
 import requests
 from flask import Flask, request, jsonify
@@ -36,15 +38,29 @@ NMS_THRESHOLD = 0.45
 
 
 # ==========================
+# PCM -> WAV
+# OpenAI 文档中的 PCM 为 24kHz, 16-bit signed, little-endian
+# ==========================
+def pcm_to_wav_bytes(pcm_bytes, sample_rate=24000, channels=1, sample_width=2):
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)   # 16-bit = 2 bytes
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return wav_buffer.getvalue()
+
+
+# ==========================
 # 上传音频到 Supabase
 # ==========================
-def upload_audio(audio_content):
-    filename = f"{uuid.uuid4()}.mp3"
+def upload_audio(audio_content, ext="wav", content_type="audio/wav"):
+    filename = f"{uuid.uuid4()}.{ext}"
 
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "audio/mpeg"
+        "Content-Type": content_type
     }
 
     upload_url = f"{SUPABASE_URL}/storage/v1/object/ai-files/tts/{filename}"
@@ -57,6 +73,35 @@ def upload_audio(audio_content):
 
     print("Supabase upload failed:", r.status_code, r.text)
     return ""
+
+
+# ==========================
+# 统一生成 TTS WAV
+# ==========================
+def generate_tts_wav_url(text, voice="alloy", speed=1.5):
+    speech = client.audio.speech.create(
+        model="tts-1",
+        voice=voice,
+        input=text,
+        speed=speed,
+        response_format="pcm"
+    )
+
+    pcm_bytes = speech.content if speech and speech.content else b""
+    print("[tts] pcm bytes =", len(pcm_bytes))
+
+    if not pcm_bytes:
+        return ""
+
+    wav_bytes = pcm_to_wav_bytes(pcm_bytes)
+    print("[tts] wav bytes =", len(wav_bytes))
+
+    audio_url = upload_audio(
+        wav_bytes,
+        ext="wav",
+        content_type="audio/wav"
+    )
+    return audio_url
 
 
 # ==========================
@@ -191,9 +236,7 @@ def detect():
                 "audio_url": ""
             })
 
-        # ✅ 获取图像尺寸（用于距离判断）
         img_height, img_width = image.shape[:2]
-
         detections = detect_objects(image)
 
         danger = False
@@ -201,17 +244,14 @@ def detect():
 
         for det in detections:
             class_name = det["class_name"]
-            box = det["box"]  # [x, y, w, h]
-            
-            # ✅ 计算 bounding box 面积和位置
-            box_area = box[2] * box[3]  # w * h
-            box_center_y = box[1] + box[3] / 2  # y + h/2
-            
-            # 计算相对大小和位置
+            box = det["box"]
+
+            box_area = box[2] * box[3]
+            box_center_y = box[1] + box[3] / 2
+
             area_ratio = box_area / (img_width * img_height)
             position_ratio = box_center_y / img_height
-            
-            # ✅ 距离判断：物体足够大 且 在画面下方 = 够近
+
             if area_ratio > 0.08 and position_ratio > 0.5:
                 if class_name == "car":
                     danger = True
@@ -235,17 +275,8 @@ def detect():
         audio_url = ""
 
         if danger and warning_text.strip():
-            speech = client.audio.speech.create(
-                model="tts-1",
-                voice="alloy",
-                input=warning_text,
-                speed=1.5
-            )
-
             print("[detect] warning_text =", warning_text)
-            print("[detect] tts bytes =", len(speech.content) if speech and speech.content else 0)
-
-            audio_url = upload_audio(speech.content)
+            audio_url = generate_tts_wav_url(warning_text, voice="alloy", speed=1.5)
             print("[detect] audio_url =", audio_url)
 
         return jsonify({
@@ -316,17 +347,8 @@ def ask_ai():
         audio_url = ""
 
         if text:
-            speech = client.audio.speech.create(
-                model="tts-1",
-                voice="alloy",
-                input=text,
-                speed=1.5
-            )
-
             print("[ask_ai] text =", text)
-            print("[ask_ai] tts bytes =", len(speech.content) if speech and speech.content else 0)
-
-            audio_url = upload_audio(speech.content)
+            audio_url = generate_tts_wav_url(text, voice="alloy", speed=1.5)
             print("[ask_ai] audio_url =", audio_url)
 
         return jsonify({
@@ -348,6 +370,7 @@ def ask_ai():
 @app.route("/test")
 def test():
     return jsonify({"status": "server running"})
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
