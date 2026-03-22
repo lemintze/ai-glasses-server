@@ -239,6 +239,7 @@ def detect():
                 model="tts-1",
                 voice="alloy",
                 input=warning_text
+                speed=1.5
             )
 
             print("[detect] warning_text =", warning_text)
@@ -319,6 +320,7 @@ def ask_ai():
                 model="tts-1",
                 voice="alloy",
                 input=text
+                speed=1.5
             )
 
             print("[ask_ai] text =", text)
