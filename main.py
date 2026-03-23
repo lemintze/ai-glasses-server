@@ -311,7 +311,7 @@ def ask_ai():
         text = "Dies ist ein Test. Wenn Sie das hören, funktioniert die AI-Wiedergabe."
         
         # 这里改成你那个 setup 里“确定能响”的音频网址
-        audio_url = "https://ai-glasses-server-production-8d74.up.railway.app/audio/car.wav"
+        audio_url = "https://qalzbatwsxwxysqevbjj.supabase.co/storage/v1/object/public/ai-files/tts/2643de76-990a-4bbf-8d1c-7898299211ca.wav"
 
         print("[ASK_AI TEST] 返回固定测试音频")
         print(f"[ASK_AI TEST] text={text}")
