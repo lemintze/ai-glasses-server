@@ -51,7 +51,7 @@ NMS_THRESHOLD = 0.45
 # PCM -> WAV
 # OpenAI PCM: 24kHz, 16-bit, mono
 # ==========================
-def pcm_to_wav_bytes(pcm_bytes, sample_rate=24000, channels=1, sample_width=2):
+def pcm_to_wav_bytes(pcm_bytes, sample_rate=16000, channels=1, sample_width=2):
     wav_buffer = io.BytesIO()
     with wave.open(wav_buffer, "wb") as wf:
         wf.setnchannels(channels)
