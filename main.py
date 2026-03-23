@@ -1,15 +1,16 @@
 # ============================================================================
-# AI智能眼镜服务器 - HTTP版本（稳定版）
-# 移除WebSocket，只用HTTP轮询
+# AI智能眼镜服务器 - HTTP版本（WAV稳定版）
+# 改进重点：
+# 1. TTS 直接请求 wav，而不是 pcm 后手动封装
+# 2. latest_audio.wav 返回时禁缓存
+# 3. 增加更详细的日志，方便确认文件大小和生成状态
 # ============================================================================
 
 import os
 import cv2
 import base64
-import wave
-import io
 import numpy as np
-from flask import Flask, request, jsonify, send_file, send_from_directory
+from flask import Flask, request, jsonify, send_file, send_from_directory, make_response
 from openai import OpenAI
 
 app = Flask(__name__)
@@ -31,7 +32,9 @@ print("=" * 70)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# ==========================
 # 路径配置
+# ==========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "yolov5n.onnx")
 AUDIO_DIR = os.path.join(BASE_DIR, "audio")
@@ -47,7 +50,9 @@ DANGER_AUDIO_MAP = {
     "person": "person.wav",
 }
 
+# ==========================
 # 加载模型
+# ==========================
 print("正在加载YOLO模型...")
 net = cv2.dnn.readNetFromONNX(MODEL_PATH)
 print("✓ 模型加载成功")
@@ -61,32 +66,6 @@ NMS_THRESHOLD = 0.45
 # ==========================
 # 辅助函数
 # ==========================
-
-def pcm_to_wav_bytes(pcm_bytes, sample_rate=24000, channels=1, sample_width=2):
-    wav_buffer = io.BytesIO()
-    with wave.open(wav_buffer, "wb") as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(sample_width)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm_bytes)
-    return wav_buffer.getvalue()
-
-def generate_latest_tts_file(text, voice="alloy", speed=1.5):
-    try:
-        speech = client.audio.speech.create(
-            model="tts-1", voice=voice, input=text, speed=speed, response_format="pcm"
-        )
-        pcm_bytes = speech.content if speech and speech.content else b""
-        if not pcm_bytes:
-            return False
-        wav_bytes = pcm_to_wav_bytes(pcm_bytes)
-        with open(LATEST_AUDIO_PATH, "wb") as f:
-            f.write(wav_bytes)
-        return True
-    except Exception as e:
-        print(f"[TTS] 错误：{e}")
-        return False
-
 def get_latest_audio_url():
     return request.host_url.rstrip("/") + "/latest_audio.wav"
 
@@ -101,47 +80,70 @@ def letterbox(image, new_shape=(640, 640), color=(114, 114, 114)):
     dh = new_shape[0] - new_unpad[1]
     dw /= 2
     dh /= 2
+
     if shape[::-1] != new_unpad:
         image = cv2.resize(image, new_unpad, interpolation=cv2.INTER_LINEAR)
+
     top = int(round(dh - 0.1))
     bottom = int(round(dh + 0.1))
     left = int(round(dw - 0.1))
     right = int(round(dw + 0.1))
-    image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+
+    image = cv2.copyMakeBorder(
+        image, top, bottom, left, right,
+        cv2.BORDER_CONSTANT, value=color
+    )
     return image, r, dw, dh
 
 def detect_objects(image):
     original = image.copy()
     h0, w0 = original.shape[:2]
+
     img, r, dw, dh = letterbox(original, (INPUT_SIZE, INPUT_SIZE))
-    blob = cv2.dnn.blobFromImage(img, scalefactor=1/255.0, size=(INPUT_SIZE, INPUT_SIZE), swapRB=True, crop=False)
+    blob = cv2.dnn.blobFromImage(
+        img,
+        scalefactor=1 / 255.0,
+        size=(INPUT_SIZE, INPUT_SIZE),
+        swapRB=True,
+        crop=False
+    )
+
     net.setInput(blob)
     outputs = net.forward()
     predictions = outputs[0]
+
     boxes, confidences, class_ids = [], [], []
+
     for pred in predictions:
         obj_conf = float(pred[4])
         if obj_conf < CONF_THRESHOLD:
             continue
+
         class_scores = pred[5:]
         class_id = int(np.argmax(class_scores))
         class_score = float(class_scores[class_id])
         confidence = obj_conf * class_score
+
         if confidence < SCORE_THRESHOLD:
             continue
+
         cx, cy, w, h = pred[0:4]
         x = (cx - w / 2 - dw) / r
         y = (cy - h / 2 - dh) / r
         w = w / r
         h = h / r
+
         x = max(0, min(x, w0 - 1))
         y = max(0, min(y, h0 - 1))
         w = max(0, min(w, w0 - x))
         h = max(0, min(h, h0 - y))
+
         boxes.append([int(x), int(y), int(w), int(h)])
         confidences.append(float(confidence))
         class_ids.append(class_id)
+
     indices = cv2.dnn.NMSBoxes(boxes, confidences, SCORE_THRESHOLD, NMS_THRESHOLD)
+
     detections = []
     if len(indices) > 0:
         for i in indices.flatten():
@@ -153,17 +155,77 @@ def detect_objects(image):
                     "confidence": confidences[i],
                     "box": boxes[i]
                 })
+
     return detections
+
+def generate_latest_tts_file(text, voice="alloy", speed=1.0):
+    """
+    直接向 OpenAI 请求 WAV，避免 pcm -> 手动封装 wav 造成兼容性问题
+    """
+    try:
+        print(f"[TTS] 开始生成语音，文本前60字: {text[:60]}")
+        print(f"[TTS] voice={voice}, speed={speed}, format=wav")
+
+        speech = client.audio.speech.create(
+            model="tts-1",
+            voice=voice,
+            input=text,
+            speed=speed,
+            response_format="wav"
+        )
+
+        wav_bytes = speech.content if speech and speech.content else b""
+
+        if not wav_bytes:
+            print("[TTS] ❌ 未收到音频内容")
+            return False
+
+        with open(LATEST_AUDIO_PATH, "wb") as f:
+            f.write(wav_bytes)
+
+        if not os.path.exists(LATEST_AUDIO_PATH):
+            print("[TTS] ❌ latest_audio.wav 未成功写入")
+            return False
+
+        file_size = os.path.getsize(LATEST_AUDIO_PATH)
+        print(f"[TTS] ✅ latest_audio.wav 已生成，大小: {file_size} bytes")
+
+        if file_size < 100:
+            print("[TTS] ❌ 音频文件过小，疑似无效")
+            return False
+
+        return True
+
+    except Exception as e:
+        print(f"[TTS] 错误：{e}")
+        return False
 
 # ==========================
 # HTTP 路由
 # ==========================
-
 @app.route("/latest_audio.wav", methods=["GET"])
 def latest_audio():
     if not os.path.exists(LATEST_AUDIO_PATH):
         return jsonify({"error": "latest audio not found"}), 404
-    return send_file(LATEST_AUDIO_PATH, mimetype="audio/wav", as_attachment=False)
+
+    file_size = os.path.getsize(LATEST_AUDIO_PATH)
+    print(f"[AUDIO] 提供 latest_audio.wav, 大小: {file_size} bytes")
+
+    response = make_response(
+        send_file(
+            LATEST_AUDIO_PATH,
+            mimetype="audio/wav",
+            as_attachment=False,
+            download_name="latest_audio.wav"
+        )
+    )
+
+    # 禁缓存，避免 ESP32 或中间层拿到旧文件
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+
+    return response
 
 @app.route("/audio/<path:filename>", methods=["GET"])
 def serve_audio(filename):
@@ -173,17 +235,27 @@ def serve_audio(filename):
 def detect():
     try:
         img_bytes = request.get_data()
+
         if not img_bytes:
             return jsonify({"danger": False, "text": "", "audio_url": ""})
+
         npimg = np.frombuffer(img_bytes, np.uint8)
         image = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+
         if image is None:
-            return jsonify({"danger": False, "text": "Bild konnte nicht gelesen werden.", "audio_url": ""})
+            return jsonify({
+                "danger": False,
+                "text": "Bild konnte nicht gelesen werden.",
+                "audio_url": ""
+            })
+
         img_height, img_width = image.shape[:2]
         detections = detect_objects(image)
+
         danger = False
         warning_text = ""
         warning_class = ""
+
         for det in detections:
             class_name = det["class_name"]
             box = det["box"]
@@ -191,6 +263,7 @@ def detect():
             box_center_y = box[1] + box[3] / 2
             area_ratio = box_area / (img_width * img_height)
             position_ratio = box_center_y / img_height
+
             if area_ratio > 0.08 and position_ratio > 0.5:
                 if class_name == "car":
                     danger = True
@@ -212,23 +285,37 @@ def detect():
                     warning_class = "person"
                     warning_text = "Person vor Ihnen, bitte vorsichtig gehen."
                     break
+
         audio_url = ""
         if danger and warning_class in DANGER_AUDIO_MAP:
             filename = DANGER_AUDIO_MAP[warning_class]
             audio_url = get_danger_audio_url(filename)
-        return jsonify({"danger": danger, "text": warning_text, "audio_url": audio_url})
+
+        return jsonify({
+            "danger": danger,
+            "text": warning_text,
+            "audio_url": audio_url
+        })
+
     except Exception as e:
         print(f"[detect] 错误：{str(e)}")
-        return jsonify({"danger": False, "text": str(e), "audio_url": ""}), 500
+        return jsonify({
+            "danger": False,
+            "text": str(e),
+            "audio_url": ""
+        }), 500
 
 @app.route("/ask_ai", methods=["POST"])
 def ask_ai():
     try:
         img_bytes = request.get_data()
+
         if not img_bytes:
             return jsonify({"text": "Kein Bild empfangen.", "audio_url": ""}), 400
+
         base64_image = base64.b64encode(img_bytes).decode("utf-8")
         image_url = f"data:image/jpeg;base64,{base64_image}"
+
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -246,16 +333,32 @@ def ask_ai():
             ],
             max_tokens=150
         )
+
         text = response.choices[0].message.content.strip()
+        print(f"[AI] 生成文本: {text}")
+
         audio_url = ""
         if text:
-            ok = generate_latest_tts_file(text, voice="alloy", speed=1.5)
+            ok = generate_latest_tts_file(text, voice="alloy", speed=1.0)
             if ok:
                 audio_url = get_latest_audio_url()
-        return jsonify({"text": text, "audio_url": audio_url})
+                print(f"[AI] ✅ 音频地址: {audio_url}")
+            else:
+                print("[AI] ❌ TTS生成失败")
+        else:
+            print("[AI] ⚠️ 文本为空，跳过TTS")
+
+        return jsonify({
+            "text": text,
+            "audio_url": audio_url
+        })
+
     except Exception as e:
         print(f"[ask_ai] 错误：{str(e)}")
-        return jsonify({"text": f"Error: {str(e)}", "audio_url": ""}), 500
+        return jsonify({
+            "text": f"Error: {str(e)}",
+            "audio_url": ""
+        }), 500
 
 @app.route("/test")
 def test():
