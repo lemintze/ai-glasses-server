@@ -1,6 +1,6 @@
 # ============================================================================
 # AI智能眼镜服务器 - Flask + WebSocket + YOLO + OpenAI
-# 保留您原有的所有配置，只添加WebSocket支持
+# 完整修复版 - 环境变量 + 图片格式 + 错误处理
 # ============================================================================
 
 import os
@@ -20,13 +20,38 @@ from collections import deque
 import threading
 
 # ============================================================================
-# 配置部分（保留您原有的）
+# 配置部分
 # ============================================================================
 
 app = Flask(__name__)
 sock = Sock(app)
 
+# ==========================
+# 环境变量读取（修复版）
+# ==========================
+print("=" * 70)
+print("正在读取环境变量...")
+
+# 方法1：从环境变量读取
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+# 调试输出
+print(f"OPENAI_API_KEY: {'***' + OPENAI_API_KEY[-4:] if OPENAI_API_KEY else 'NOT SET'}")
+print(f"SUPABASE_URL: {SUPABASE_URL}")
+print(f"SUPABASE_KEY: {'***' + SUPABASE_KEY[-4:] if SUPABASE_KEY else 'NOT SET'}")
+
+# 验证必要的环境变量
+if not OPENAI_API_KEY:
+    print("❌ 错误：OPENAI_API_KEY 环境变量未设置！")
+    print("   请在 Railway 后台 Variables 中添加 OPENAI_API_KEY")
+    raise ValueError("OPENAI_API_KEY 环境变量未设置！")
+
+print("✓ 环境变量读取成功")
+print("=" * 70)
+
+# 初始化 OpenAI 客户端
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # 路径配置
@@ -40,7 +65,7 @@ TTS_CACHE_DIR = os.path.join(BASE_DIR, "tts_cache")
 for directory in [AUDIO_DIR, TTS_CACHE_DIR]:
     os.makedirs(directory, exist_ok=True)
 
-# 预录危险提示音频（保留您的）
+# 预录危险提示音频
 DANGER_AUDIO_MAP = {
     "car": "car.wav",
     "bus": "bus.wav",
@@ -48,10 +73,16 @@ DANGER_AUDIO_MAP = {
     "person": "person.wav",
 }
 
+# ==========================
 # 加载 ONNX 模型
+# ==========================
 print("正在加载YOLO模型...")
-net = cv2.dnn.readNetFromONNX(MODEL_PATH)
-print("✓ 模型加载成功" if net else "✗ 模型加载失败")
+try:
+    net = cv2.dnn.readNetFromONNX(MODEL_PATH)
+    print("✓ YOLO模型加载成功")
+except Exception as e:
+    print(f"✗ YOLO模型加载失败：{e}")
+    net = None
 
 DANGER_CLASS_MAP = {
     0: "person",
@@ -65,19 +96,19 @@ CONF_THRESHOLD = 0.45
 SCORE_THRESHOLD = 0.45
 NMS_THRESHOLD = 0.45
 
-# WebSocket连接管理（新增）
+# WebSocket连接管理
 esp32_connections = {}
 esp32_connections_lock = threading.Lock()
 danger_cooldown = {}
 cooldown_lock = threading.Lock()
-DANGER_COOLDOWN_SECONDS = 3  # 危险报警冷却时间
+DANGER_COOLDOWN_SECONDS = 3
 
 # ============================================================================
-# 辅助函数（保留您原有的）
+# 辅助函数
 # ============================================================================
 
 def pcm_to_wav_bytes(pcm_bytes, sample_rate=16000, channels=1, sample_width=2):
-    """PCM转WAV（保留您的）"""
+    """PCM转WAV"""
     wav_buffer = io.BytesIO()
     with wave.open(wav_buffer, "wb") as wf:
         wf.setnchannels(channels)
@@ -88,8 +119,9 @@ def pcm_to_wav_bytes(pcm_bytes, sample_rate=16000, channels=1, sample_width=2):
 
 
 def generate_latest_tts_file(text, voice="alloy", speed=1.5):
-    """生成TTS音频（保留您的）"""
+    """生成TTS音频"""
     try:
+        print(f"[TTS] 正在生成语音：{text[:50]}...")
         speech = client.audio.speech.create(
             model="tts-1",
             voice=voice,
@@ -99,36 +131,36 @@ def generate_latest_tts_file(text, voice="alloy", speed=1.5):
         )
 
         pcm_bytes = speech.content if speech and speech.content else b""
-        print(f"[tts] pcm bytes = {len(pcm_bytes)}")
+        print(f"[TTS] PCM 字节数：{len(pcm_bytes)}")
 
         if not pcm_bytes:
             return False
 
         wav_bytes = pcm_to_wav_bytes(pcm_bytes)
-        print(f"[tts] wav bytes = {len(wav_bytes)}")
+        print(f"[TTS] WAV 字节数：{len(wav_bytes)}")
 
         with open(LATEST_AUDIO_PATH, "wb") as f:
             f.write(wav_bytes)
 
-        print(f"[tts] latest audio saved to {LATEST_AUDIO_PATH}")
+        print(f"[TTS] 音频已保存到：{LATEST_AUDIO_PATH}")
         return True
     except Exception as e:
-        print(f"[tts] 错误: {e}")
+        print(f"[TTS] 错误：{e}")
         return False
 
 
 def get_latest_audio_url():
-    """获取最新音频URL（保留您的）"""
+    """获取最新音频URL"""
     return request.host_url.rstrip("/") + "/latest_audio.wav"
 
 
 def get_danger_audio_url(filename):
-    """获取预录音频URL（保留您的）"""
+    """获取预录音频URL"""
     return request.host_url.rstrip("/") + f"/audio/{filename}"
 
 
 def letterbox(image, new_shape=(640, 640), color=(114, 114, 114)):
-    """图像预处理（保留您的）"""
+    """图像预处理"""
     shape = image.shape[:2]
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
 
@@ -153,7 +185,7 @@ def letterbox(image, new_shape=(640, 640), color=(114, 114, 114)):
 
 
 def detect_objects(image):
-    """YOLO检测（保留您的）"""
+    """YOLO检测"""
     original = image.copy()
     h0, w0 = original.shape[:2]
 
@@ -227,7 +259,7 @@ def detect_objects(image):
 
 
 def check_danger_cooldown(danger_type):
-    """检查危险冷却时间（新增）"""
+    """检查危险冷却时间"""
     current_time = time.time()
     
     with cooldown_lock:
@@ -239,27 +271,23 @@ def check_danger_cooldown(danger_type):
 
 
 def process_video_frame(data):
-    """处理视频帧（新增）"""
+    """处理视频帧"""
     try:
         npimg = np.frombuffer(data, np.uint8)
         image = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
         return image
     except Exception as e:
-        print(f"视频帧处理错误: {e}")
+        print(f"视频帧处理错误：{e}")
         return None
 
 
 # ============================================================================
-# WebSocket 路由（新增 - 自动检测实时推送）
+# WebSocket 路由
 # ============================================================================
 
 @sock.route('/ws')
 def ws(websocket):
-    """
-    ESP32 WebSocket连接
-    接收: 视频帧 (binary)
-    发送: 危险警告 (JSON)
-    """
+    """ESP32 WebSocket连接"""
     connection_id = str(uuid.uuid4())
     
     with esp32_connections_lock:
@@ -269,12 +297,10 @@ def ws(websocket):
             'frame_count': 0
         }
     
-    print(f"✓ ESP32已连接: {connection_id}")
-    print(f"  当前连接数: {len(esp32_connections)}")
+    print(f"✓ ESP32已连接：{connection_id}")
     
     try:
         while True:
-            # 接收视频帧
             data = websocket.receive()
             image = process_video_frame(data)
             
@@ -285,16 +311,13 @@ def ws(websocket):
                 if connection_id in esp32_connections:
                     esp32_connections[connection_id]['frame_count'] += 1
             
-            # YOLO检测
             detections = detect_objects(image)
             img_height, img_width = image.shape[:2]
             
-            # 检查危险
             for det in detections:
                 class_name = det["class_name"]
                 box = det["box"]
                 
-                # 危险判断逻辑（保留您的）
                 box_area = box[2] * box[3]
                 box_center_y = box[1] + box[3] / 2
                 area_ratio = box_area / (img_width * img_height)
@@ -315,25 +338,24 @@ def ws(websocket):
                         })
                         
                         websocket.send(warning_message)
-                        print(f"⚠️ 危险警告: {class_name}")
+                        print(f"⚠️ 危险警告：{class_name}")
             
     except Exception as e:
-        print(f"✗ ESP32断开: {connection_id}, 错误: {e}")
+        print(f"✗ ESP32断开：{connection_id}, 错误：{e}")
     
     finally:
         with esp32_connections_lock:
             if connection_id in esp32_connections:
                 del esp32_connections[connection_id]
-        print(f"✓ ESP32已断开: {connection_id}")
 
 
 # ============================================================================
-# HTTP 路由（保留您原有的）
+# HTTP 路由
 # ============================================================================
 
 @app.route("/latest_audio.wav", methods=["GET"])
 def latest_audio():
-    """提供最新TTS音频（保留您的）"""
+    """提供最新TTS音频"""
     if not os.path.exists(LATEST_AUDIO_PATH):
         return jsonify({"error": "latest audio not found"}), 404
 
@@ -348,7 +370,7 @@ def latest_audio():
 
 @app.route("/audio/<path:filename>", methods=["GET"])
 def serve_audio(filename):
-    """提供预录音频（保留您的）"""
+    """提供预录音频"""
     return send_from_directory(
         AUDIO_DIR,
         filename,
@@ -359,7 +381,7 @@ def serve_audio(filename):
 
 @app.route("/tts/<path:filename>", methods=["GET"])
 def serve_tts(filename):
-    """提供TTS缓存音频（新增）"""
+    """提供TTS缓存音频"""
     return send_from_directory(
         TTS_CACHE_DIR,
         filename,
@@ -370,7 +392,7 @@ def serve_tts(filename):
 
 @app.route("/detect", methods=["POST"])
 def detect():
-    """自动危险检测 - HTTP版本（保留您的）"""
+    """自动危险检测 - HTTP版本"""
     try:
         img_bytes = request.get_data()
         if not img_bytes:
@@ -432,7 +454,7 @@ def detect():
         if danger and warning_class in DANGER_AUDIO_MAP:
             filename = DANGER_AUDIO_MAP[warning_class]
             audio_url = get_danger_audio_url(filename)
-            print(f"[detect] use prerecorded audio: {filename}")
+            print(f"[detect] 使用预录音频：{filename}")
 
         return jsonify({
             "danger": danger,
@@ -441,7 +463,7 @@ def detect():
         })
 
     except Exception as e:
-        print(f"[detect] error: {str(e)}")
+        print(f"[detect] 错误：{str(e)}")
         return jsonify({
             "danger": False,
             "text": str(e),
@@ -451,7 +473,7 @@ def detect():
 
 @app.route("/ask_ai", methods=["POST"])
 def ask_ai():
-    """按钮触发AI场景描述（保留您的）"""
+    """按钮触发AI场景描述"""
     try:
         img_bytes = request.get_data()
         if not img_bytes:
@@ -460,7 +482,14 @@ def ask_ai():
                 "audio_url": ""
             }), 400
 
+        print(f"[ask_ai] 收到图片数据：{len(img_bytes)} 字节")
+        
         base64_image = base64.b64encode(img_bytes).decode("utf-8")
+        print(f"[ask_ai] Base64长度：{len(base64_image)}")
+
+        # ✅ 修复：添加 data: 前缀
+        image_url = f"data:image/jpeg;base64,{base64_image}"
+        print(f"[ask_ai] 图片URL前缀：{image_url[:50]}...")
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -487,19 +516,21 @@ def ask_ai():
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"image/jpeg;base64,{base64_image}"
+                                "url": image_url
                             }
                         }
                     ]
                 }
-            ]
+            ],
+            max_tokens=150
         )
 
         text = response.choices[0].message.content.strip()
+        print(f"[ask_ai] AI回复：{text}")
+        
         audio_url = ""
 
         if text:
-            print(f"[ask_ai] text = {text}")
             ok = generate_latest_tts_file(
                 text,
                 voice="alloy",
@@ -507,7 +538,7 @@ def ask_ai():
             )
             if ok:
                 audio_url = get_latest_audio_url()
-                print(f"[ask_ai] latest audio url = {audio_url}")
+                print(f"[ask_ai] 音频URL：{audio_url}")
 
         return jsonify({
             "text": text,
@@ -515,22 +546,22 @@ def ask_ai():
         })
 
     except Exception as e:
-        print(f"[ask_ai] error: {str(e)}")
+        print(f"[ask_ai] 错误：{str(e)}")
         return jsonify({
-            "text": str(e),
+            "text": f"Error: {str(e)}",
             "audio_url": ""
         }), 500
 
 
 @app.route("/test")
 def test():
-    """测试接口（保留您的）"""
+    """测试接口"""
     return jsonify({"status": "server running"})
 
 
 @app.route("/health")
 def health():
-    """健康检查（新增）"""
+    """健康检查"""
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
@@ -541,7 +572,7 @@ def health():
 
 @app.route("/stats")
 def stats():
-    """服务器统计（新增）"""
+    """服务器统计"""
     with esp32_connections_lock:
         connections_info = []
         for conn_id, conn_data in esp32_connections.items():
@@ -559,7 +590,7 @@ def stats():
 
 
 # ============================================================================
-# 主程序入口（保留您的）
+# 主程序入口
 # ============================================================================
 
 if __name__ == "__main__":
@@ -567,15 +598,9 @@ if __name__ == "__main__":
     print("=" * 70)
     print("AI智能眼镜服务器启动中...")
     print("=" * 70)
-    print(f"  监听端口: {port}")
-    print(f"  音频目录: {AUDIO_DIR}")
-    print(f"  TTS缓存: {TTS_CACHE_DIR}")
-    print("=" * 70)
-    print("可用接口:")
-    print("  WebSocket: ws://localhost:5000/ws  (自动检测)")
-    print("  HTTP POST: http://localhost:5000/detect  (危险检测)")
-    print("  HTTP POST: http://localhost:5000/ask_ai  (AI描述)")
-    print("  HTTP GET:  http://localhost:5000/health  (健康检查)")
+    print(f"  监听端口：{port}")
+    print(f"  音频目录：{AUDIO_DIR}")
+    print(f"  TTS缓存：{TTS_CACHE_DIR}")
     print("=" * 70)
     
     app.run(host="0.0.0.0", port=port, threaded=True)
