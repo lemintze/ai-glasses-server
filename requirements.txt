@@ -1,6 +1,8 @@
-flask
-openai
-requests
-gunicorn
-numpy
-opencv-python-headless
+flask==3.0.0
+flask-sock==0.6.0
+openai==1.12.0
+requests==2.31.0
+gunicorn==21.2.0
+numpy==1.24.3
+opencv-python-headless==4.9.0.80
+python-dotenv==1.0.0
