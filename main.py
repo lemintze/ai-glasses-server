@@ -1,31 +1,39 @@
 import os
 import cv2
-import uuid
 import base64
 import wave
 import io
-import threading
 import numpy as np
-import requests
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, send_file, send_from_directory
 from openai import OpenAI
 
 app = Flask(__name__)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ==========================
+# 路径配置
+# ==========================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "yolov5n.onnx")
+AUDIO_DIR = os.path.join(BASE_DIR, "audio")
+LATEST_AUDIO_PATH = os.path.join(BASE_DIR, "latest_audio.wav")
+
+# 预录危险提示音频
+DANGER_AUDIO_MAP = {
+    "car": "car.wav",
+    "bus": "bus.wav",
+    "truck": "truck.wav",
+    "person": "person.wav",
+}
 
 # ==========================
 # 加载 ONNX 模型
 # ==========================
-MODEL_PATH = "yolov5n.onnx"
 net = cv2.dnn.readNetFromONNX(MODEL_PATH)
 
-# 只保留危险类别
 DANGER_CLASS_MAP = {
     0: "person",
     2: "car",
@@ -38,66 +46,25 @@ CONF_THRESHOLD = 0.45
 SCORE_THRESHOLD = 0.45
 NMS_THRESHOLD = 0.45
 
-# ==========================
-# 最新音频缓存（固定音频出口）
-# ==========================
-LATEST_AUDIO_BYTES = None
-LATEST_AUDIO_MIMETYPE = "audio/wav"
-LATEST_AUDIO_LOCK = threading.Lock()
-
-
-def set_latest_audio(audio_bytes: bytes, mimetype: str = "audio/wav"):
-    global LATEST_AUDIO_BYTES, LATEST_AUDIO_MIMETYPE
-    with LATEST_AUDIO_LOCK:
-        LATEST_AUDIO_BYTES = audio_bytes
-        LATEST_AUDIO_MIMETYPE = mimetype
-    print(f"[latest_audio] cached bytes = {len(audio_bytes)}")
-
 
 # ==========================
 # PCM -> WAV
-# OpenAI 文档中的 PCM 为 24kHz, 16-bit signed, little-endian
+# OpenAI PCM: 24kHz, 16-bit, mono
 # ==========================
 def pcm_to_wav_bytes(pcm_bytes, sample_rate=24000, channels=1, sample_width=2):
     wav_buffer = io.BytesIO()
     with wave.open(wav_buffer, "wb") as wf:
         wf.setnchannels(channels)
-        wf.setsampwidth(sample_width)  # 16-bit = 2 bytes
+        wf.setsampwidth(sample_width)
         wf.setframerate(sample_rate)
         wf.writeframes(pcm_bytes)
     return wav_buffer.getvalue()
 
 
 # ==========================
-# 上传音频到 Supabase
+# 生成 AI 语音并写到本地 latest_audio.wav
 # ==========================
-def upload_audio(audio_content, ext="wav", content_type="audio/wav"):
-    filename = f"{uuid.uuid4()}.{ext}"
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": content_type
-    }
-
-    upload_url = f"{SUPABASE_URL}/storage/v1/object/ai-files/tts/{filename}"
-    r = requests.put(upload_url, data=audio_content, headers=headers, timeout=30)
-
-    if r.status_code in [200, 201]:
-        public_url = f"{SUPABASE_URL}/storage/v1/object/public/ai-files/tts/{filename}"
-        print("Supabase upload success:", public_url)
-        return public_url
-
-    print("Supabase upload failed:", r.status_code, r.text)
-    return ""
-
-
-# ==========================
-# 统一生成 TTS WAV
-# 同时：
-# 1. 上传到 Supabase（保留你原来的逻辑）
-# 2. 存到 latest_audio 缓存（给固定地址播放）
-# ==========================
-def generate_tts_wav(text, voice="alloy", speed=1.5):
+def generate_latest_tts_file(text, voice="alloy", speed=1.5):
     speech = client.audio.speech.create(
         model="tts-1",
         voice=voice,
@@ -110,58 +77,56 @@ def generate_tts_wav(text, voice="alloy", speed=1.5):
     print("[tts] pcm bytes =", len(pcm_bytes))
 
     if not pcm_bytes:
-        return b""
+        return False
 
     wav_bytes = pcm_to_wav_bytes(pcm_bytes)
     print("[tts] wav bytes =", len(wav_bytes))
-    return wav_bytes
+
+    with open(LATEST_AUDIO_PATH, "wb") as f:
+        f.write(wav_bytes)
+
+    print("[tts] latest audio saved to", LATEST_AUDIO_PATH)
+    return True
 
 
-def generate_tts_wav_url_and_cache(text, voice="alloy", speed=1.5):
-    wav_bytes = generate_tts_wav(text, voice=voice, speed=speed)
-
-    if not wav_bytes:
-        return ""
-
-    # 先缓存给固定出口
-    set_latest_audio(wav_bytes, "audio/wav")
-
-    # 再上传到 Supabase，保留原逻辑，便于你继续检查和备份
-    audio_url = upload_audio(
-        wav_bytes,
-        ext="wav",
-        content_type="audio/wav"
-    )
-    return audio_url
-
-
+# ==========================
+# 获取最新音频固定地址
+# ==========================
 def get_latest_audio_url():
-    # 返回当前请求对应的固定地址
     return request.host_url.rstrip("/") + "/latest_audio.wav"
 
 
 # ==========================
-# 固定音频出口
+# 获取预录危险音频固定地址
+# ==========================
+def get_danger_audio_url(filename):
+    return request.host_url.rstrip("/") + f"/audio/{filename}"
+
+
+# ==========================
+# 文件服务
 # ==========================
 @app.route("/latest_audio.wav", methods=["GET"])
 def latest_audio():
-    with LATEST_AUDIO_LOCK:
-        if not LATEST_AUDIO_BYTES:
-            return jsonify({"error": "no audio available"}), 404
+    if not os.path.exists(LATEST_AUDIO_PATH):
+        return jsonify({"error": "latest audio not found"}), 404
 
-        audio_bytes = LATEST_AUDIO_BYTES
-        mimetype = LATEST_AUDIO_MIMETYPE
+    return send_file(
+        LATEST_AUDIO_PATH,
+        mimetype="audio/wav",
+        as_attachment=False,
+        download_name="latest_audio.wav",
+        max_age=0
+    )
 
-    return Response(
-        audio_bytes,
-        mimetype=mimetype,
-        headers={
-            "Content-Type": mimetype,
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Expires": "0",
-            "Connection": "close",
-        }
+
+@app.route("/audio/<path:filename>", methods=["GET"])
+def serve_audio(filename):
+    return send_from_directory(
+        AUDIO_DIR,
+        filename,
+        as_attachment=False,
+        max_age=0
     )
 
 
@@ -269,7 +234,9 @@ def detect_objects(image):
 
 
 # ==========================
-# 自动危险检测（带距离判断）
+# 自动危险检测
+# 不再实时生成 TTS
+# 直接返回你预录好的本地音频文件
 # ==========================
 @app.route("/detect", methods=["POST"])
 def detect():
@@ -297,6 +264,7 @@ def detect():
 
         danger = False
         warning_text = ""
+        warning_class = ""
 
         for det in detections:
             class_name = det["class_name"]
@@ -310,18 +278,22 @@ def detect():
             if area_ratio > 0.08 and position_ratio > 0.5:
                 if class_name == "car":
                     danger = True
+                    warning_class = "car"
                     warning_text = "Achtung, ein Auto nähert sich."
                     break
                 elif class_name == "bus":
                     danger = True
+                    warning_class = "bus"
                     warning_text = "Achtung, ein Bus kommt."
                     break
                 elif class_name == "truck":
                     danger = True
+                    warning_class = "truck"
                     warning_text = "Achtung, ein Lastwagen nähert sich."
                     break
                 elif class_name == "person":
                     danger = True
+                    warning_class = "person"
                     warning_text = "Person vor Ihnen, bitte vorsichtig gehen."
                     break
             else:
@@ -330,24 +302,16 @@ def detect():
                     f"(area={area_ratio:.3f}, pos={position_ratio:.3f})，不播报"
                 )
 
-        supabase_audio_url = ""
-        fixed_audio_url = ""
-
-        if danger and warning_text.strip():
-            print("[detect] warning_text =", warning_text)
-            supabase_audio_url = generate_tts_wav_url_and_cache(
-                warning_text,
-                voice="alloy",
-                speed=1.5
-            )
-            fixed_audio_url = get_latest_audio_url()
-            print("[detect] supabase_audio_url =", supabase_audio_url)
-            print("[detect] fixed_audio_url =", fixed_audio_url)
+        audio_url = ""
+        if danger and warning_class in DANGER_AUDIO_MAP:
+            filename = DANGER_AUDIO_MAP[warning_class]
+            audio_url = get_danger_audio_url(filename)
+            print("[detect] use prerecorded audio:", filename)
 
         return jsonify({
             "danger": danger,
             "text": warning_text,
-            "audio_url": fixed_audio_url
+            "audio_url": audio_url
         })
 
     except Exception as e:
@@ -361,6 +325,7 @@ def detect():
 
 # ==========================
 # 按钮触发 AI 场景描述
+# 生成 latest_audio.wav 并返回固定地址
 # ==========================
 @app.route("/ask_ai", methods=["POST"])
 def ask_ai():
@@ -408,24 +373,22 @@ def ask_ai():
         )
 
         text = response.choices[0].message.content.strip()
-
-        supabase_audio_url = ""
-        fixed_audio_url = ""
+        audio_url = ""
 
         if text:
             print("[ask_ai] text =", text)
-            supabase_audio_url = generate_tts_wav_url_and_cache(
+            ok = generate_latest_tts_file(
                 text,
                 voice="alloy",
                 speed=1.5
             )
-            fixed_audio_url = get_latest_audio_url()
-            print("[ask_ai] supabase_audio_url =", supabase_audio_url)
-            print("[ask_ai] fixed_audio_url =", fixed_audio_url)
+            if ok:
+                audio_url = get_latest_audio_url()
+                print("[ask_ai] latest audio url =", audio_url)
 
         return jsonify({
             "text": text,
-            "audio_url": fixed_audio_url
+            "audio_url": audio_url
         })
 
     except Exception as e:
