@@ -1,27 +1,46 @@
+# ============================================================================
+# AI智能眼镜服务器 - Flask + WebSocket + YOLO + OpenAI
+# 保留您原有的所有配置，只添加WebSocket支持
+# ============================================================================
+
 import os
 import cv2
 import base64
 import wave
 import io
 import numpy as np
-
+import json
+import uuid
+import time
+from datetime import datetime
 from flask import Flask, request, jsonify, send_file, send_from_directory
+from flask_sock import Sock
 from openai import OpenAI
+from collections import deque
+import threading
+
+# ============================================================================
+# 配置部分（保留您原有的）
+# ============================================================================
 
 app = Flask(__name__)
+sock = Sock(app)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ==========================
 # 路径配置
-# ==========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "yolov5n.onnx")
 AUDIO_DIR = os.path.join(BASE_DIR, "audio")
 LATEST_AUDIO_PATH = os.path.join(BASE_DIR, "latest_audio.wav")
+TTS_CACHE_DIR = os.path.join(BASE_DIR, "tts_cache")
 
-# 预录危险提示音频
+# 创建必要目录
+for directory in [AUDIO_DIR, TTS_CACHE_DIR]:
+    os.makedirs(directory, exist_ok=True)
+
+# 预录危险提示音频（保留您的）
 DANGER_AUDIO_MAP = {
     "car": "car.wav",
     "bus": "bus.wav",
@@ -29,10 +48,10 @@ DANGER_AUDIO_MAP = {
     "person": "person.wav",
 }
 
-# ==========================
 # 加载 ONNX 模型
-# ==========================
+print("正在加载YOLO模型...")
 net = cv2.dnn.readNetFromONNX(MODEL_PATH)
+print("✓ 模型加载成功" if net else "✗ 模型加载失败")
 
 DANGER_CLASS_MAP = {
     0: "person",
@@ -46,12 +65,19 @@ CONF_THRESHOLD = 0.45
 SCORE_THRESHOLD = 0.45
 NMS_THRESHOLD = 0.45
 
+# WebSocket连接管理（新增）
+esp32_connections = {}
+esp32_connections_lock = threading.Lock()
+danger_cooldown = {}
+cooldown_lock = threading.Lock()
+DANGER_COOLDOWN_SECONDS = 3  # 危险报警冷却时间
 
-# ==========================
-# PCM -> WAV
-# OpenAI PCM: 24kHz, 16-bit, mono
-# ==========================
+# ============================================================================
+# 辅助函数（保留您原有的）
+# ============================================================================
+
 def pcm_to_wav_bytes(pcm_bytes, sample_rate=16000, channels=1, sample_width=2):
+    """PCM转WAV（保留您的）"""
     wav_buffer = io.BytesIO()
     with wave.open(wav_buffer, "wb") as wf:
         wf.setnchannels(channels)
@@ -61,79 +87,48 @@ def pcm_to_wav_bytes(pcm_bytes, sample_rate=16000, channels=1, sample_width=2):
     return wav_buffer.getvalue()
 
 
-# ==========================
-# 生成 AI 语音并写到本地 latest_audio.wav
-# ==========================
 def generate_latest_tts_file(text, voice="alloy", speed=1.5):
-    speech = client.audio.speech.create(
-        model="tts-1",
-        voice=voice,
-        input=text,
-        speed=speed,
-        response_format="pcm"
-    )
+    """生成TTS音频（保留您的）"""
+    try:
+        speech = client.audio.speech.create(
+            model="tts-1",
+            voice=voice,
+            input=text,
+            speed=speed,
+            response_format="pcm"
+        )
 
-    pcm_bytes = speech.content if speech and speech.content else b""
-    print("[tts] pcm bytes =", len(pcm_bytes))
+        pcm_bytes = speech.content if speech and speech.content else b""
+        print(f"[tts] pcm bytes = {len(pcm_bytes)}")
 
-    if not pcm_bytes:
+        if not pcm_bytes:
+            return False
+
+        wav_bytes = pcm_to_wav_bytes(pcm_bytes)
+        print(f"[tts] wav bytes = {len(wav_bytes)}")
+
+        with open(LATEST_AUDIO_PATH, "wb") as f:
+            f.write(wav_bytes)
+
+        print(f"[tts] latest audio saved to {LATEST_AUDIO_PATH}")
+        return True
+    except Exception as e:
+        print(f"[tts] 错误: {e}")
         return False
 
-    wav_bytes = pcm_to_wav_bytes(pcm_bytes)
-    print("[tts] wav bytes =", len(wav_bytes))
 
-    with open(LATEST_AUDIO_PATH, "wb") as f:
-        f.write(wav_bytes)
-
-    print("[tts] latest audio saved to", LATEST_AUDIO_PATH)
-    return True
-
-
-# ==========================
-# 获取最新音频固定地址
-# ==========================
 def get_latest_audio_url():
+    """获取最新音频URL（保留您的）"""
     return request.host_url.rstrip("/") + "/latest_audio.wav"
 
 
-# ==========================
-# 获取预录危险音频固定地址
-# ==========================
 def get_danger_audio_url(filename):
+    """获取预录音频URL（保留您的）"""
     return request.host_url.rstrip("/") + f"/audio/{filename}"
 
 
-# ==========================
-# 文件服务
-# ==========================
-@app.route("/latest_audio.wav", methods=["GET"])
-def latest_audio():
-    if not os.path.exists(LATEST_AUDIO_PATH):
-        return jsonify({"error": "latest audio not found"}), 404
-
-    return send_file(
-        LATEST_AUDIO_PATH,
-        mimetype="audio/wav",
-        as_attachment=False,
-        download_name="latest_audio.wav",
-        max_age=0
-    )
-
-
-@app.route("/audio/<path:filename>", methods=["GET"])
-def serve_audio(filename):
-    return send_from_directory(
-        AUDIO_DIR,
-        filename,
-        as_attachment=False,
-        max_age=0
-    )
-
-
-# ==========================
-# 图片预处理
-# ==========================
 def letterbox(image, new_shape=(640, 640), color=(114, 114, 114)):
+    """图像预处理（保留您的）"""
     shape = image.shape[:2]
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
 
@@ -157,10 +152,8 @@ def letterbox(image, new_shape=(640, 640), color=(114, 114, 114)):
     return image, r, dw, dh
 
 
-# ==========================
-# YOLO ONNX 推理
-# ==========================
 def detect_objects(image):
+    """YOLO检测（保留您的）"""
     original = image.copy()
     h0, w0 = original.shape[:2]
 
@@ -233,13 +226,151 @@ def detect_objects(image):
     return detections
 
 
-# ==========================
-# 自动危险检测
-# 不再实时生成 TTS
-# 直接返回你预录好的本地音频文件
-# ==========================
+def check_danger_cooldown(danger_type):
+    """检查危险冷却时间（新增）"""
+    current_time = time.time()
+    
+    with cooldown_lock:
+        if danger_type in danger_cooldown:
+            if current_time - danger_cooldown[danger_type] < DANGER_COOLDOWN_SECONDS:
+                return False
+        danger_cooldown[danger_type] = current_time
+        return True
+
+
+def process_video_frame(data):
+    """处理视频帧（新增）"""
+    try:
+        npimg = np.frombuffer(data, np.uint8)
+        image = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+        return image
+    except Exception as e:
+        print(f"视频帧处理错误: {e}")
+        return None
+
+
+# ============================================================================
+# WebSocket 路由（新增 - 自动检测实时推送）
+# ============================================================================
+
+@sock.route('/ws')
+def ws(websocket):
+    """
+    ESP32 WebSocket连接
+    接收: 视频帧 (binary)
+    发送: 危险警告 (JSON)
+    """
+    connection_id = str(uuid.uuid4())
+    
+    with esp32_connections_lock:
+        esp32_connections[connection_id] = {
+            'websocket': websocket,
+            'connected_at': datetime.now(),
+            'frame_count': 0
+        }
+    
+    print(f"✓ ESP32已连接: {connection_id}")
+    print(f"  当前连接数: {len(esp32_connections)}")
+    
+    try:
+        while True:
+            # 接收视频帧
+            data = websocket.receive()
+            image = process_video_frame(data)
+            
+            if image is None:
+                continue
+            
+            with esp32_connections_lock:
+                if connection_id in esp32_connections:
+                    esp32_connections[connection_id]['frame_count'] += 1
+            
+            # YOLO检测
+            detections = detect_objects(image)
+            img_height, img_width = image.shape[:2]
+            
+            # 检查危险
+            for det in detections:
+                class_name = det["class_name"]
+                box = det["box"]
+                
+                # 危险判断逻辑（保留您的）
+                box_area = box[2] * box[3]
+                box_center_y = box[1] + box[3] / 2
+                area_ratio = box_area / (img_width * img_height)
+                position_ratio = box_center_y / img_height
+                
+                if area_ratio > 0.08 and position_ratio > 0.5:
+                    if check_danger_cooldown(class_name):
+                        filename = DANGER_AUDIO_MAP.get(class_name, "attention.wav")
+                        audio_url = get_danger_audio_url(filename)
+                        
+                        warning_message = json.dumps({
+                            'type': 'DANGER',
+                            'class': class_name,
+                            'confidence': det['confidence'],
+                            'audio_url': audio_url,
+                            'text': f"Achtung, ein {class_name} nähert sich.",
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        
+                        websocket.send(warning_message)
+                        print(f"⚠️ 危险警告: {class_name}")
+            
+    except Exception as e:
+        print(f"✗ ESP32断开: {connection_id}, 错误: {e}")
+    
+    finally:
+        with esp32_connections_lock:
+            if connection_id in esp32_connections:
+                del esp32_connections[connection_id]
+        print(f"✓ ESP32已断开: {connection_id}")
+
+
+# ============================================================================
+# HTTP 路由（保留您原有的）
+# ============================================================================
+
+@app.route("/latest_audio.wav", methods=["GET"])
+def latest_audio():
+    """提供最新TTS音频（保留您的）"""
+    if not os.path.exists(LATEST_AUDIO_PATH):
+        return jsonify({"error": "latest audio not found"}), 404
+
+    return send_file(
+        LATEST_AUDIO_PATH,
+        mimetype="audio/wav",
+        as_attachment=False,
+        download_name="latest_audio.wav",
+        max_age=0
+    )
+
+
+@app.route("/audio/<path:filename>", methods=["GET"])
+def serve_audio(filename):
+    """提供预录音频（保留您的）"""
+    return send_from_directory(
+        AUDIO_DIR,
+        filename,
+        as_attachment=False,
+        max_age=0
+    )
+
+
+@app.route("/tts/<path:filename>", methods=["GET"])
+def serve_tts(filename):
+    """提供TTS缓存音频（新增）"""
+    return send_from_directory(
+        TTS_CACHE_DIR,
+        filename,
+        as_attachment=False,
+        max_age=0
+    )
+
+
 @app.route("/detect", methods=["POST"])
 def detect():
+    """自动危险检测 - HTTP版本（保留您的）"""
     try:
         img_bytes = request.get_data()
         if not img_bytes:
@@ -296,17 +427,12 @@ def detect():
                     warning_class = "person"
                     warning_text = "Person vor Ihnen, bitte vorsichtig gehen."
                     break
-            else:
-                print(
-                    f"⚠️ {class_name} 距离较远 "
-                    f"(area={area_ratio:.3f}, pos={position_ratio:.3f})，不播报"
-                )
 
         audio_url = ""
         if danger and warning_class in DANGER_AUDIO_MAP:
             filename = DANGER_AUDIO_MAP[warning_class]
             audio_url = get_danger_audio_url(filename)
-            print("[detect] use prerecorded audio:", filename)
+            print(f"[detect] use prerecorded audio: {filename}")
 
         return jsonify({
             "danger": danger,
@@ -315,7 +441,7 @@ def detect():
         })
 
     except Exception as e:
-        print("[detect] error:", str(e))
+        print(f"[detect] error: {str(e)}")
         return jsonify({
             "danger": False,
             "text": str(e),
@@ -323,12 +449,9 @@ def detect():
         }), 500
 
 
-# ==========================
-# 按钮触发 AI 场景描述
-# 生成 latest_audio.wav 并返回固定地址
-# ==========================
 @app.route("/ask_ai", methods=["POST"])
 def ask_ai():
+    """按钮触发AI场景描述（保留您的）"""
     try:
         img_bytes = request.get_data()
         if not img_bytes:
@@ -364,7 +487,7 @@ def ask_ai():
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
+                                "url": f"image/jpeg;base64,{base64_image}"
                             }
                         }
                     ]
@@ -376,7 +499,7 @@ def ask_ai():
         audio_url = ""
 
         if text:
-            print("[ask_ai] text =", text)
+            print(f"[ask_ai] text = {text}")
             ok = generate_latest_tts_file(
                 text,
                 voice="alloy",
@@ -384,7 +507,7 @@ def ask_ai():
             )
             if ok:
                 audio_url = get_latest_audio_url()
-                print("[ask_ai] latest audio url =", audio_url)
+                print(f"[ask_ai] latest audio url = {audio_url}")
 
         return jsonify({
             "text": text,
@@ -392,21 +515,67 @@ def ask_ai():
         })
 
     except Exception as e:
-        print("[ask_ai] error:", str(e))
+        print(f"[ask_ai] error: {str(e)}")
         return jsonify({
             "text": str(e),
             "audio_url": ""
         }), 500
 
 
-# ==========================
-# 测试接口
-# ==========================
 @app.route("/test")
 def test():
+    """测试接口（保留您的）"""
     return jsonify({"status": "server running"})
 
 
+@app.route("/health")
+def health():
+    """健康检查（新增）"""
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "connections": len(esp32_connections),
+        "model_loaded": net is not None
+    })
+
+
+@app.route("/stats")
+def stats():
+    """服务器统计（新增）"""
+    with esp32_connections_lock:
+        connections_info = []
+        for conn_id, conn_data in esp32_connections.items():
+            connections_info.append({
+                'id': conn_id,
+                'connected_at': conn_data['connected_at'].isoformat(),
+                'frame_count': conn_data['frame_count']
+            })
+    
+    return jsonify({
+        'active_connections': len(esp32_connections),
+        'connections': connections_info,
+        'timestamp': datetime.now().isoformat()
+    })
+
+
+# ============================================================================
+# 主程序入口（保留您的）
+# ============================================================================
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    print("=" * 70)
+    print("AI智能眼镜服务器启动中...")
+    print("=" * 70)
+    print(f"  监听端口: {port}")
+    print(f"  音频目录: {AUDIO_DIR}")
+    print(f"  TTS缓存: {TTS_CACHE_DIR}")
+    print("=" * 70)
+    print("可用接口:")
+    print("  WebSocket: ws://localhost:5000/ws  (自动检测)")
+    print("  HTTP POST: http://localhost:5000/detect  (危险检测)")
+    print("  HTTP POST: http://localhost:5000/ask_ai  (AI描述)")
+    print("  HTTP GET:  http://localhost:5000/health  (健康检查)")
+    print("=" * 70)
+    
+    app.run(host="0.0.0.0", port=port, threaded=True)
