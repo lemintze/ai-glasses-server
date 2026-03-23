@@ -4,9 +4,11 @@ import uuid
 import base64
 import wave
 import io
+import threading
 import numpy as np
 import requests
-from flask import Flask, request, jsonify
+
+from flask import Flask, request, jsonify, Response
 from openai import OpenAI
 
 app = Flask(__name__)
@@ -36,6 +38,21 @@ CONF_THRESHOLD = 0.45
 SCORE_THRESHOLD = 0.45
 NMS_THRESHOLD = 0.45
 
+# ==========================
+# 最新音频缓存（固定音频出口）
+# ==========================
+LATEST_AUDIO_BYTES = None
+LATEST_AUDIO_MIMETYPE = "audio/wav"
+LATEST_AUDIO_LOCK = threading.Lock()
+
+
+def set_latest_audio(audio_bytes: bytes, mimetype: str = "audio/wav"):
+    global LATEST_AUDIO_BYTES, LATEST_AUDIO_MIMETYPE
+    with LATEST_AUDIO_LOCK:
+        LATEST_AUDIO_BYTES = audio_bytes
+        LATEST_AUDIO_MIMETYPE = mimetype
+    print(f"[latest_audio] cached bytes = {len(audio_bytes)}")
+
 
 # ==========================
 # PCM -> WAV
@@ -45,7 +62,7 @@ def pcm_to_wav_bytes(pcm_bytes, sample_rate=24000, channels=1, sample_width=2):
     wav_buffer = io.BytesIO()
     with wave.open(wav_buffer, "wb") as wf:
         wf.setnchannels(channels)
-        wf.setsampwidth(sample_width)   # 16-bit = 2 bytes
+        wf.setsampwidth(sample_width)  # 16-bit = 2 bytes
         wf.setframerate(sample_rate)
         wf.writeframes(pcm_bytes)
     return wav_buffer.getvalue()
@@ -56,7 +73,6 @@ def pcm_to_wav_bytes(pcm_bytes, sample_rate=24000, channels=1, sample_width=2):
 # ==========================
 def upload_audio(audio_content, ext="wav", content_type="audio/wav"):
     filename = f"{uuid.uuid4()}.{ext}"
-
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -77,8 +93,11 @@ def upload_audio(audio_content, ext="wav", content_type="audio/wav"):
 
 # ==========================
 # 统一生成 TTS WAV
+# 同时：
+# 1. 上传到 Supabase（保留你原来的逻辑）
+# 2. 存到 latest_audio 缓存（给固定地址播放）
 # ==========================
-def generate_tts_wav_url(text, voice="alloy", speed=1.5):
+def generate_tts_wav(text, voice="alloy", speed=1.5):
     speech = client.audio.speech.create(
         model="tts-1",
         voice=voice,
@@ -91,11 +110,23 @@ def generate_tts_wav_url(text, voice="alloy", speed=1.5):
     print("[tts] pcm bytes =", len(pcm_bytes))
 
     if not pcm_bytes:
-        return ""
+        return b""
 
     wav_bytes = pcm_to_wav_bytes(pcm_bytes)
     print("[tts] wav bytes =", len(wav_bytes))
+    return wav_bytes
 
+
+def generate_tts_wav_url_and_cache(text, voice="alloy", speed=1.5):
+    wav_bytes = generate_tts_wav(text, voice=voice, speed=speed)
+
+    if not wav_bytes:
+        return ""
+
+    # 先缓存给固定出口
+    set_latest_audio(wav_bytes, "audio/wav")
+
+    # 再上传到 Supabase，保留原逻辑，便于你继续检查和备份
     audio_url = upload_audio(
         wav_bytes,
         ext="wav",
@@ -104,18 +135,46 @@ def generate_tts_wav_url(text, voice="alloy", speed=1.5):
     return audio_url
 
 
+def get_latest_audio_url():
+    # 返回当前请求对应的固定地址
+    return request.host_url.rstrip("/") + "/latest_audio.wav"
+
+
+# ==========================
+# 固定音频出口
+# ==========================
+@app.route("/latest_audio.wav", methods=["GET"])
+def latest_audio():
+    with LATEST_AUDIO_LOCK:
+        if not LATEST_AUDIO_BYTES:
+            return jsonify({"error": "no audio available"}), 404
+
+        audio_bytes = LATEST_AUDIO_BYTES
+        mimetype = LATEST_AUDIO_MIMETYPE
+
+    return Response(
+        audio_bytes,
+        mimetype=mimetype,
+        headers={
+            "Content-Type": mimetype,
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Connection": "close",
+        }
+    )
+
+
 # ==========================
 # 图片预处理
 # ==========================
 def letterbox(image, new_shape=(640, 640), color=(114, 114, 114)):
     shape = image.shape[:2]
-
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
-    new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
 
+    new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
     dw = new_shape[1] - new_unpad[0]
     dh = new_shape[0] - new_unpad[1]
-
     dw /= 2
     dh /= 2
 
@@ -128,10 +187,8 @@ def letterbox(image, new_shape=(640, 640), color=(114, 114, 114)):
     right = int(round(dw + 0.1))
 
     image = cv2.copyMakeBorder(
-        image, top, bottom, left, right,
-        cv2.BORDER_CONSTANT, value=color
+        image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color
     )
-
     return image, r, dw, dh
 
 
@@ -143,6 +200,7 @@ def detect_objects(image):
     h0, w0 = original.shape[:2]
 
     img, r, dw, dh = letterbox(original, (INPUT_SIZE, INPUT_SIZE))
+
     blob = cv2.dnn.blobFromImage(
         img,
         scalefactor=1 / 255.0,
@@ -167,8 +225,8 @@ def detect_objects(image):
         class_scores = pred[5:]
         class_id = int(np.argmax(class_scores))
         class_score = float(class_scores[class_id])
-
         confidence = obj_conf * class_score
+
         if confidence < SCORE_THRESHOLD:
             continue
 
@@ -199,7 +257,6 @@ def detect_objects(image):
     if len(indices) > 0:
         for i in indices.flatten():
             class_id = class_ids[i]
-
             if class_id in DANGER_CLASS_MAP:
                 detections.append({
                     "class_id": class_id,
@@ -218,7 +275,6 @@ def detect_objects(image):
 def detect():
     try:
         img_bytes = request.get_data()
-
         if not img_bytes:
             return jsonify({
                 "danger": False,
@@ -248,7 +304,6 @@ def detect():
 
             box_area = box[2] * box[3]
             box_center_y = box[1] + box[3] / 2
-
             area_ratio = box_area / (img_width * img_height)
             position_ratio = box_center_y / img_height
 
@@ -270,19 +325,29 @@ def detect():
                     warning_text = "Person vor Ihnen, bitte vorsichtig gehen."
                     break
             else:
-                print(f"⚠️ {class_name} 距离较远 (area={area_ratio:.3f}, pos={position_ratio:.3f})，不播报")
+                print(
+                    f"⚠️ {class_name} 距离较远 "
+                    f"(area={area_ratio:.3f}, pos={position_ratio:.3f})，不播报"
+                )
 
-        audio_url = ""
+        supabase_audio_url = ""
+        fixed_audio_url = ""
 
         if danger and warning_text.strip():
             print("[detect] warning_text =", warning_text)
-            audio_url = generate_tts_wav_url(warning_text, voice="alloy", speed=1.5)
-            print("[detect] audio_url =", audio_url)
+            supabase_audio_url = generate_tts_wav_url_and_cache(
+                warning_text,
+                voice="alloy",
+                speed=1.5
+            )
+            fixed_audio_url = get_latest_audio_url()
+            print("[detect] supabase_audio_url =", supabase_audio_url)
+            print("[detect] fixed_audio_url =", fixed_audio_url)
 
         return jsonify({
             "danger": danger,
             "text": warning_text,
-            "audio_url": audio_url
+            "audio_url": fixed_audio_url
         })
 
     except Exception as e:
@@ -301,7 +366,6 @@ def detect():
 def ask_ai():
     try:
         img_bytes = request.get_data()
-
         if not img_bytes:
             return jsonify({
                 "text": "Kein Bild empfangen.",
@@ -344,16 +408,24 @@ def ask_ai():
         )
 
         text = response.choices[0].message.content.strip()
-        audio_url = ""
+
+        supabase_audio_url = ""
+        fixed_audio_url = ""
 
         if text:
             print("[ask_ai] text =", text)
-            audio_url = generate_tts_wav_url(text, voice="alloy", speed=1.5)
-            print("[ask_ai] audio_url =", audio_url)
+            supabase_audio_url = generate_tts_wav_url_and_cache(
+                text,
+                voice="alloy",
+                speed=1.5
+            )
+            fixed_audio_url = get_latest_audio_url()
+            print("[ask_ai] supabase_audio_url =", supabase_audio_url)
+            print("[ask_ai] fixed_audio_url =", fixed_audio_url)
 
         return jsonify({
             "text": text,
-            "audio_url": audio_url
+            "audio_url": fixed_audio_url
         })
 
     except Exception as e:
