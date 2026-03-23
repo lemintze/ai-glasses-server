@@ -118,7 +118,7 @@ def pcm_to_wav_bytes(pcm_bytes, sample_rate=16000, channels=1, sample_width=2):
     return wav_buffer.getvalue()
 
 
-def generate_latest_tts_file(text, voice="alloy", speed=1.5):
+def generate_latest_tts_file(text, voice="aria", speed=1.5):
     """生成TTS音频"""
     try:
         print(f"[TTS] 正在生成语音：{text[:50]}...")
@@ -126,7 +126,7 @@ def generate_latest_tts_file(text, voice="alloy", speed=1.5):
             model="tts-1",
             voice=voice,
             input=text,
-            speed=speed,
+            speed=1.5,
             response_format="pcm"
         )
 
@@ -533,7 +533,7 @@ def ask_ai():
         if text:
             ok = generate_latest_tts_file(
                 text,
-                voice="alloy",
+                voice="aria",
                 speed=1.5
             )
             if ok:
