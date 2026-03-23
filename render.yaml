@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: ai-glasses-server
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.9.0
+    disk:
+      name: audio-storage
+      mountPath: /audio
+      sizeGB: 1
