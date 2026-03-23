@@ -1,4 +1,27 @@
+# Python
 __pycache__/
-*.pyc
-.env
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
 venv/
+ENV/
+
+# 敏感信息（重要！）
+.env
+*.key
+*.pem
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 临时文件
+*.log
+.DS_Store
+
+# 大文件（可选）
+*.onnx
