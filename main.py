@@ -308,58 +308,26 @@ def detect():
 @app.route("/ask_ai", methods=["POST"])
 def ask_ai():
     try:
-        img_bytes = request.get_data()
+        text = "Dies ist ein Test. Wenn Sie das hören, funktioniert die AI-Wiedergabe."
+        
+        # 这里改成你那个 setup 里“确定能响”的音频网址
+        audio_url = "https://ai-glasses-server-production-8d74.up.railway.app/latest_audio.wav"
 
-        if not img_bytes:
-            return jsonify({"text": "Kein Bild empfangen.", "audio_url": ""}), 400
-
-        base64_image = base64.b64encode(img_bytes).decode("utf-8")
-        image_url = f"data:image/jpeg;base64,{base64_image}"
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Du bist ein hilfreicher Assistent für blinde Nutzer. Maximal 1-2 Sätze. Auf Deutsch."
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Beschreibe bitte die aktuelle Szene kurz und hilfreich."},
-                        {"type": "image_url", "image_url": {"url": image_url}}
-                    ]
-                }
-            ],
-            max_tokens=150
-        )
-
-        text = response.choices[0].message.content.strip()
-        print(f"[AI] 生成文本: {text}")
-
-        audio_url = ""
-        if text:
-            ok = generate_latest_tts_file(text, voice="alloy", speed=1.5)
-            if ok:
-                audio_url = get_latest_audio_url()
-                print(f"[AI] ✅ 音频地址: {audio_url}")
-            else:
-                print("[AI] ❌ TTS生成失败")
-        else:
-            print("[AI] ⚠️ 文本为空，跳过TTS")
+        print("[ASK_AI TEST] 返回固定测试音频")
+        print(f"[ASK_AI TEST] text={text}")
+        print(f"[ASK_AI TEST] audio_url={audio_url}")
 
         return jsonify({
             "text": text,
             "audio_url": audio_url
         })
-
     except Exception as e:
         print(f"[ask_ai] 错误：{str(e)}")
         return jsonify({
             "text": f"Error: {str(e)}",
             "audio_url": ""
         }), 500
-
+        
 @app.route("/test")
 def test():
     return jsonify({"status": "server running"})
