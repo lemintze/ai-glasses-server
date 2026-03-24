@@ -420,6 +420,9 @@ def detect():
             "audio_url": audio_url
         })
 
+    print("outputs.shape:", outputs.shape)
+    print("outputs sample:", outputs[0][0][:10])
+
     except Exception as e:
         print(f"[detect] 错误：{str(e)}")
         return jsonify({
