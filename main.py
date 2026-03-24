@@ -1,9 +1,10 @@
 # ============================================================================
-# AI智能眼镜服务器 - HTTP版本（WAV稳定版）
+# AI智能眼镜服务器 - HTTP版本（真实TTS版）
 # 改进重点：
-# 1. TTS 直接请求 wav，而不是 pcm 后手动封装
-# 2. latest_audio.wav 返回时禁缓存
-# 3. 增加更详细的日志，方便确认文件大小和生成状态
+# 1. /ask_ai 恢复为真实图像理解 + 真实 TTS 生成
+# 2. TTS 直接请求 wav，不走 pcm 手动封装
+# 3. latest_audio.wav 返回时禁缓存
+# 4. 增加详细日志，便于确认文本、文件大小、audio_url
 # ============================================================================
 
 import os
@@ -158,7 +159,7 @@ def detect_objects(image):
 
     return detections
 
-def generate_latest_tts_file(text, voice="alloy", speed=1.5):
+def generate_latest_tts_file(text, voice="alloy", speed=1.0):
     """
     直接向 OpenAI 请求 WAV，避免 pcm -> 手动封装 wav 造成兼容性问题
     """
@@ -308,26 +309,61 @@ def detect():
 @app.route("/ask_ai", methods=["POST"])
 def ask_ai():
     try:
-        text = "Dies ist ein Test. Wenn Sie das hören, funktioniert die AI-Wiedergabe."
-        
-        # 这里改成你那个 setup 里“确定能响”的音频网址
-        audio_url = "https://qalzbatwsxwxysqevbjj.supabase.co/storage/v1/object/public/ai-files/tts/2643de76-990a-4bbf-8d1c-7898299211ca.wav"
+        img_bytes = request.get_data()
 
-        print("[ASK_AI TEST] 返回固定测试音频")
-        print(f"[ASK_AI TEST] text={text}")
-        print(f"[ASK_AI TEST] audio_url={audio_url}")
+        if not img_bytes:
+            return jsonify({"text": "Kein Bild empfangen.", "audio_url": ""}), 400
+
+        print(f"[ASK_AI] 收到图片，大小: {len(img_bytes)} bytes")
+
+        base64_image = base64.b64encode(img_bytes).decode("utf-8")
+        image_url = f"data:image/jpeg;base64,{base64_image}"
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Du bist ein hilfreicher Assistent für blinde Nutzer. Antworte auf Deutsch, kurz, klar und praktisch. Maximal 1 bis 2 Sätze."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Beschreibe bitte die aktuelle Szene kurz und hilfreich."},
+                        {"type": "image_url", "image_url": {"url": image_url}}
+                    ]
+                }
+            ],
+            max_tokens=120
+        )
+
+        text = response.choices[0].message.content.strip() if response.choices and response.choices[0].message.content else ""
+        print(f"[ASK_AI] 生成文本: {text}")
+
+        audio_url = ""
+
+        if text:
+            ok = generate_latest_tts_file(text, voice="alloy", speed=1.0)
+            if ok:
+                audio_url = get_latest_audio_url()
+                print(f"[ASK_AI] ✅ 返回真实TTS音频: {audio_url}")
+            else:
+                print("[ASK_AI] ❌ TTS生成失败")
+        else:
+            print("[ASK_AI] ⚠️ 文本为空，跳过TTS")
 
         return jsonify({
             "text": text,
             "audio_url": audio_url
         })
+
     except Exception as e:
         print(f"[ask_ai] 错误：{str(e)}")
         return jsonify({
             "text": f"Error: {str(e)}",
             "audio_url": ""
         }), 500
-        
+
 @app.route("/test")
 def test():
     return jsonify({"status": "server running"})
