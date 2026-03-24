@@ -11,10 +11,23 @@ import os
 import cv2
 import base64
 import numpy as np
-from flask import Flask, request, jsonify, send_file, send_from_directory, make_response, Response
+from flask import Flask, request, jsonify, send_file, send_from_directory, make_response, Response, render_template_string
 from openai import OpenAI
+import time
 
 app = Flask(__name__)
+
+# ==========================
+# 调试用：保存最近一帧
+# ==========================
+latest_raw_frame = None
+latest_annotated_frame = None
+latest_debug_info = {
+    "timestamp": "",
+    "danger": False,
+    "warning_text": "",
+    "detections": []
+}
 
 # ==========================
 # 环境变量读取
@@ -201,6 +214,28 @@ def generate_latest_tts_file(text, voice="alloy", speed=1.0):
         print(f"[TTS] 错误：{e}")
         return False
 
+def draw_detections(image, detections):
+    vis = image.copy()
+
+    for det in detections:
+        x, y, w, h = det["box"]
+        class_name = det["class_name"]
+        conf = det["confidence"]
+
+        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        label = f"{class_name} {conf:.2f}"
+        cv2.putText(
+            vis,
+            label,
+            (x, max(20, y - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2
+        )
+
+    return vis
+
 # ==========================
 # HTTP 路由
 # ==========================
@@ -237,6 +272,8 @@ def serve_audio(filename):
 
 @app.route("/detect", methods=["POST"])
 def detect():
+    global latest_raw_frame, latest_annotated_frame, latest_debug_info
+
     try:
         img_bytes = request.get_data()
 
@@ -253,12 +290,17 @@ def detect():
                 "audio_url": ""
             })
 
+        # 保存原图
+        latest_raw_frame = image.copy()
+
         img_height, img_width = image.shape[:2]
         detections = detect_objects(image)
 
         danger = False
         warning_text = ""
         warning_class = ""
+
+        debug_detections = []
 
         for det in detections:
             class_name = det["class_name"]
@@ -267,6 +309,14 @@ def detect():
             box_center_y = box[1] + box[3] / 2
             area_ratio = box_area / (img_width * img_height)
             position_ratio = box_center_y / img_height
+
+            debug_detections.append({
+                "class_name": class_name,
+                "confidence": round(det["confidence"], 3),
+                "box": box,
+                "area_ratio": round(area_ratio, 3),
+                "position_ratio": round(position_ratio, 3)
+            })
 
             if area_ratio > 0.08 and position_ratio > 0.5:
                 if class_name == "car":
@@ -289,6 +339,20 @@ def detect():
                     warning_class = "person"
                     warning_text = "Person vor Ihnen, bitte vorsichtig gehen."
                     break
+
+        # 保存带框图
+        latest_annotated_frame = draw_detections(image, detections)
+
+        # 保存调试信息
+        latest_debug_info = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "danger": danger,
+            "warning_text": warning_text,
+            "detections": debug_detections
+        }
+
+        print(f"[DETECT] detections={debug_detections}")
+        print(f"[DETECT] danger={danger}, warning_text={warning_text}")
 
         audio_url = ""
         if danger and warning_class in DANGER_AUDIO_MAP:
@@ -366,6 +430,99 @@ def ask_ai():
             "text": f"Error: {str(e)}",
             "audio_url": ""
         }), 500
+
+@app.route("/debug/raw.jpg")
+def debug_raw_jpg():
+    global latest_raw_frame
+
+    if latest_raw_frame is None:
+        return jsonify({"error": "no raw frame yet"}), 404
+
+    ok, buf = cv2.imencode(".jpg", latest_raw_frame)
+    if not ok:
+        return jsonify({"error": "encode failed"}), 500
+
+    return Response(buf.tobytes(), mimetype="image/jpeg")
+
+
+@app.route("/debug/annotated.jpg")
+def debug_annotated_jpg():
+    global latest_annotated_frame
+
+    if latest_annotated_frame is None:
+        return jsonify({"error": "no annotated frame yet"}), 404
+
+    ok, buf = cv2.imencode(".jpg", latest_annotated_frame)
+    if not ok:
+        return jsonify({"error": "encode failed"}), 500
+
+    return Response(buf.tobytes(), mimetype="image/jpeg")
+
+
+@app.route("/debug/status")
+def debug_status():
+    return jsonify(latest_debug_info)
+
+@app.route("/debug/view")
+def debug_view():
+    html = """
+    <!doctype html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>AI Glasses Debug View</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; background: #f7f7f7; }
+            h1 { margin-bottom: 10px; }
+            .row { display: flex; gap: 20px; flex-wrap: wrap; }
+            .card { background: white; padding: 16px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+            img { width: 480px; max-width: 100%; border: 1px solid #ddd; border-radius: 8px; }
+            pre { background: #111; color: #0f0; padding: 12px; border-radius: 8px; overflow-x: auto; }
+        </style>
+    </head>
+    <body>
+        <h1>AI Glasses Debug View</h1>
+        <p>这个页面会显示最近一次 detect 请求的原图、带框图和检测信息。</p>
+
+        <div class="row">
+            <div class="card">
+                <h3>原始画面</h3>
+                <img id="raw" src="/debug/raw.jpg">
+            </div>
+
+            <div class="card">
+                <h3>带框画面</h3>
+                <img id="ann" src="/debug/annotated.jpg">
+            </div>
+        </div>
+
+        <div class="card" style="margin-top:20px;">
+            <h3>检测信息</h3>
+            <pre id="status">loading...</pre>
+        </div>
+
+        <script>
+            async function refreshDebug() {
+                const t = Date.now();
+                document.getElementById("raw").src = "/debug/raw.jpg?t=" + t;
+                document.getElementById("ann").src = "/debug/annotated.jpg?t=" + t;
+
+                try {
+                    const res = await fetch("/debug/status?t=" + t);
+                    const data = await res.json();
+                    document.getElementById("status").textContent = JSON.stringify(data, null, 2);
+                } catch (e) {
+                    document.getElementById("status").textContent = "failed to load status";
+                }
+            }
+
+            refreshDebug();
+            setInterval(refreshDebug, 1000);
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
 
 @app.route("/test")
 def test():
