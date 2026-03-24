@@ -11,7 +11,7 @@ import os
 import cv2
 import base64
 import numpy as np
-from flask import Flask, request, jsonify, send_file, send_from_directory, make_response
+from flask import Flask, request, jsonify, send_file, send_from_directory, make_response, Response
 from openai import OpenAI
 
 app = Flask(__name__)
@@ -209,24 +209,27 @@ def latest_audio():
     if not os.path.exists(LATEST_AUDIO_PATH):
         return jsonify({"error": "latest audio not found"}), 404
 
-    file_size = os.path.getsize(LATEST_AUDIO_PATH)
-    print(f"[AUDIO] 提供 latest_audio.wav, 大小: {file_size} bytes")
+    try:
+        with open(LATEST_AUDIO_PATH, "rb") as f:
+            wav_data = f.read()
 
-    response = make_response(
-        send_file(
-            LATEST_AUDIO_PATH,
-            mimetype="audio/wav",
-            as_attachment=False,
-            download_name="latest_audio.wav"
-        )
-    )
+        file_size = len(wav_data)
+        print(f"[AUDIO] 提供 latest_audio.wav, 大小: {file_size} bytes")
 
-    # 禁缓存，避免 ESP32 或中间层拿到旧文件
-    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    response.headers["Pragma"] = "no-cache"
-    response.headers["Expires"] = "0"
+        response = Response(wav_data, mimetype="audio/wav")
+        response.headers["Content-Length"] = str(file_size)
+        response.headers["Content-Type"] = "audio/wav"
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        response.headers["Connection"] = "close"
+        response.headers["Accept-Ranges"] = "none"
 
-    return response
+        return response
+
+    except Exception as e:
+        print(f"[AUDIO] 提供 latest_audio.wav 失败: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/audio/<path:filename>", methods=["GET"])
 def serve_audio(filename):
