@@ -1,12 +1,12 @@
 # ============================================================================
-# AI智能眼镜服务器 - HTTP版本（真实TTS + YOLO调试修正版）
+# AI智能眼镜服务器 - HTTP版本（真实TTS + YOLO调试 + 稳定危险提醒版）
 # 功能：
 # 1. /ask_ai 使用真实图像理解 + 真实 TTS 生成
-# 2. TTS 直接请求 wav，speed=1.5
-# 3. /latest_audio.wav 使用更适合 ESP32 的完整 Response 返回
-# 4. /detect 保存最近原图、带框图、检测信息
-# 5. /debug/view 调试网页可查看原图、带框图、检测信息
-# 6. YOLO 输出解析兼容常见 ONNX 形状，避免 class_id 变成 8000+
+# 2. /detect 使用 YOLO 检测危险，也走真实 TTS
+# 3. danger 状态带短暂记忆，避免忽有忽无
+# 4. danger 播报带冷却，避免一直重复说话
+# 5. person 增加方向判断：links / direkt / rechts
+# 6. /debug/view 调试网页可查看原图、带框图、检测信息
 # ============================================================================
 
 import os
@@ -37,6 +37,23 @@ latest_debug_info = {
     "warning_text": "",
     "detections": []
 }
+
+# ==========================
+# 危险状态记忆 & 播报冷却
+# ==========================
+last_danger_state = {
+    "active": False,
+    "class_name": "",
+    "warning_text": "",
+    "timestamp": 0.0
+}
+
+# 危险状态保留时间（秒）
+DANGER_MEMORY_SECONDS = 1.0
+
+# 连续播报冷却时间（秒）
+ALERT_COOLDOWN_SECONDS = 3.0
+last_alert_tts_time = 0.0
 
 # ==========================
 # 环境变量读取
@@ -145,7 +162,6 @@ def normalize_predictions(outputs):
     - (85, N)
     - 84 维（YOLOv8 风格：4 box + 80 classes，无 obj_conf）
     """
-    # OpenCV DNN 通常直接返回 ndarray，但保险起见兼容 list/tuple
     if isinstance(outputs, (list, tuple)):
         arr = outputs[0]
     else:
@@ -154,27 +170,20 @@ def normalize_predictions(outputs):
     arr = np.array(arr)
     print(f"[YOLO SHAPE] raw outputs.shape={arr.shape}")
 
-    # 去掉 batch 维
     if arr.ndim == 3 and arr.shape[0] == 1:
         arr = arr[0]
         print(f"[YOLO SHAPE] removed batch -> {arr.shape}")
 
-    # 现在希望变成 (N, C)
     if arr.ndim == 2:
-        # 已经是 (N, 85) 或 (N, 84)
         if arr.shape[1] in (84, 85):
             preds = arr
-        # 是 (85, N) 或 (84, N)
         elif arr.shape[0] in (84, 85):
             preds = arr.transpose(1, 0)
         else:
             raise ValueError(f"无法识别的二维输出形状: {arr.shape}")
     elif arr.ndim == 3:
-        # 某些模型可能还是三维
-        # 尝试最后一维是 84/85
         if arr.shape[-1] in (84, 85):
             preds = arr.reshape(-1, arr.shape[-1])
-        # 尝试第二维是 84/85
         elif arr.shape[1] in (84, 85):
             preds = arr.transpose(0, 2, 1).reshape(-1, arr.shape[1])
         else:
@@ -204,15 +213,14 @@ def detect_objects(image):
 
     boxes, confidences, class_ids = [], [], []
 
-    # 调试计数器
     raw_count = 0
     passed_conf_count = 0
     passed_score_count = 0
     passed_candidates = []
 
     pred_dim = predictions.shape[1]
-    is_yolov5_style = (pred_dim == 85)  # 4 + obj + 80
-    is_yolov8_style = (pred_dim == 84)  # 4 + 80，无 obj
+    is_yolov5_style = (pred_dim == 85)   # 4 + obj + 80
+    is_yolov8_style = (pred_dim == 84)   # 4 + 80
 
     if not (is_yolov5_style or is_yolov8_style):
         print(f"[YOLO DEBUG] 非预期维度 pred_dim={pred_dim}")
@@ -231,9 +239,7 @@ def detect_objects(image):
             class_id = int(np.argmax(class_scores))
             class_score = float(class_scores[class_id])
             confidence = obj_conf * class_score
-
         else:
-            # YOLOv8 风格：没有单独 obj_conf
             obj_conf = 1.0
             passed_conf_count += 1
 
@@ -335,9 +341,6 @@ def draw_detections(image, detections):
     return vis
 
 def generate_latest_tts_file(text, voice="alloy", speed=1.5):
-    """
-    直接向 OpenAI 请求 WAV，避免 pcm -> 手动封装 wav 造成兼容性问题
-    """
     try:
         print(f"[TTS] 开始生成语音，文本前60字: {text[:60]}")
         print(f"[TTS] voice={voice}, speed={speed}, format=wav")
@@ -376,6 +379,18 @@ def generate_latest_tts_file(text, voice="alloy", speed=1.5):
         print(f"[TTS] 错误：{e}")
         return False
 
+def get_direction_text(box, img_width):
+    x, y, w, h = box
+    center_x = x + w / 2
+    x_ratio = center_x / img_width
+
+    if x_ratio < 0.33:
+        return "links"
+    elif x_ratio > 0.66:
+        return "rechts"
+    else:
+        return "direkt"
+
 # ==========================
 # HTTP 路由
 # ==========================
@@ -413,6 +428,7 @@ def serve_audio(filename):
 @app.route("/detect", methods=["POST"])
 def detect():
     global latest_raw_frame, latest_annotated_frame, latest_debug_info
+    global last_danger_state, last_alert_tts_time
 
     try:
         img_bytes = request.get_data()
@@ -430,7 +446,6 @@ def detect():
                 "audio_url": ""
             })
 
-        # 保存原图
         latest_raw_frame = image.copy()
 
         img_height, img_width = image.shape[:2]
@@ -438,53 +453,96 @@ def detect():
 
         danger = False
         warning_text = ""
+        warning_class = ""
 
         debug_detections = []
+        now = time.time()
 
+        # 先根据当前帧检测判断危险
         for det in detections:
             class_name = det["class_name"]
             box = det["box"]
+            conf = float(det["confidence"])
 
             box_area = box[2] * box[3]
             box_center_y = box[1] + box[3] / 2
             area_ratio = box_area / (img_width * img_height)
             position_ratio = box_center_y / img_height
 
+            direction_text = get_direction_text(box, img_width)
+
             debug_detections.append({
                 "class_name": class_name,
-                "confidence": round(det["confidence"], 3),
+                "confidence": round(conf, 3),
                 "box": box,
                 "area_ratio": round(area_ratio, 3),
-                "position_ratio": round(position_ratio, 3)
+                "position_ratio": round(position_ratio, 3),
+                "direction": direction_text
             })
 
-            # 先用更宽松的逻辑验证整条链
-            if class_name == "person" and det["confidence"] > 0.35:
+            # person：提前到更远距离触发
+            if class_name == "person" and conf > 0.35 and area_ratio > 0.03:
                 danger = True
-                warning_text = "Person vor Ihnen."
+                warning_class = "person"
+                if direction_text == "links":
+                    warning_text = "Person links vor Ihnen."
+                elif direction_text == "rechts":
+                    warning_text = "Person rechts vor Ihnen."
+                else:
+                    warning_text = "Person direkt vor Ihnen."
                 break
-            elif class_name == "car" and det["confidence"] > 0.35:
+
+            # car / bus / truck 先保守一点
+            elif class_name == "car" and conf > 0.35 and area_ratio > 0.03:
                 danger = True
+                warning_class = "car"
                 warning_text = "Achtung, ein Auto vor Ihnen."
                 break
-            elif class_name == "bus" and det["confidence"] > 0.35:
+
+            elif class_name == "bus" and conf > 0.35 and area_ratio > 0.03:
                 danger = True
+                warning_class = "bus"
                 warning_text = "Achtung, ein Bus vor Ihnen."
                 break
-            elif class_name == "truck" and det["confidence"] > 0.35:
+
+            elif class_name == "truck" and conf > 0.35 and area_ratio > 0.03:
                 danger = True
+                warning_class = "truck"
                 warning_text = "Achtung, ein Lastwagen vor Ihnen."
                 break
 
-        # 保存带框图
+        # ==========================
+        # 危险状态记忆（检测层稳定）
+        # ==========================
+        if danger:
+            last_danger_state = {
+                "active": True,
+                "class_name": warning_class,
+                "warning_text": warning_text,
+                "timestamp": now
+            }
+        else:
+            # 如果当前帧没检测到，但最近1秒检测到过，就保留危险状态
+            if last_danger_state["active"] and (now - last_danger_state["timestamp"] <= DANGER_MEMORY_SECONDS):
+                danger = True
+                warning_class = last_danger_state["class_name"]
+                warning_text = last_danger_state["warning_text"]
+            else:
+                last_danger_state = {
+                    "active": False,
+                    "class_name": "",
+                    "warning_text": "",
+                    "timestamp": 0.0
+                }
+
         latest_annotated_frame = draw_detections(image, detections)
 
-        # 保存调试信息
         latest_debug_info = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "danger": danger,
             "warning_text": warning_text,
-            "detections": debug_detections
+            "detections": debug_detections,
+            "danger_memory_active": last_danger_state["active"]
         }
 
         print(f"[DETECT] detections={debug_detections}")
@@ -492,14 +550,20 @@ def detect():
 
         audio_url = ""
 
-        # 关键：危险提示也改走 TTS，不再使用 /audio/car.wav 这类本地文件
+        # ==========================
+        # 播报冷却（语音层克制）
+        # ==========================
         if danger and warning_text:
-            ok = generate_latest_tts_file(warning_text, voice="alloy", speed=1.5)
-            if ok:
-                audio_url = get_latest_audio_url()
-                print(f"[DETECT] ✅ 危险提示TTS已生成: {audio_url}")
+            if now - last_alert_tts_time >= ALERT_COOLDOWN_SECONDS:
+                ok = generate_latest_tts_file(warning_text, voice="alloy", speed=1.5)
+                if ok:
+                    audio_url = get_latest_audio_url()
+                    last_alert_tts_time = now
+                    print(f"[DETECT] ✅ 危险提示TTS已生成: {audio_url}")
+                else:
+                    print("[DETECT] ❌ 危险提示TTS生成失败")
             else:
-                print("[DETECT] ❌ 危险提示TTS生成失败")
+                print(f"[DETECT] ⏳ 仍在播报冷却中，剩余 {round(ALERT_COOLDOWN_SECONDS - (now - last_alert_tts_time), 2)} 秒")
 
         return jsonify({
             "danger": danger,
@@ -514,7 +578,7 @@ def detect():
             "text": str(e),
             "audio_url": ""
         }), 500
-        
+
 @app.route("/ask_ai", methods=["POST"])
 def ask_ai():
     try:
