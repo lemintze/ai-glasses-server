@@ -438,7 +438,6 @@ def detect():
 
         danger = False
         warning_text = ""
-        warning_class = ""
 
         debug_detections = []
 
@@ -459,28 +458,23 @@ def detect():
                 "position_ratio": round(position_ratio, 3)
             })
 
-            # 先保留你原来的危险判定逻辑
-            if area_ratio > 0.08 and position_ratio > 0.5:
-                if class_name == "car":
-                    danger = True
-                    warning_class = "car"
-                    warning_text = "Achtung, ein Auto nähert sich."
-                    break
-                elif class_name == "bus":
-                    danger = True
-                    warning_class = "bus"
-                    warning_text = "Achtung, ein Bus kommt."
-                    break
-                elif class_name == "truck":
-                    danger = True
-                    warning_class = "truck"
-                    warning_text = "Achtung, ein Lastwagen nähert sich."
-                    break
-                elif class_name == "person":
-                    danger = True
-                    warning_class = "person"
-                    warning_text = "Person vor Ihnen, bitte vorsichtig gehen."
-                    break
+            # 先用更宽松的逻辑验证整条链
+            if class_name == "person" and det["confidence"] > 0.35:
+                danger = True
+                warning_text = "Person vor Ihnen."
+                break
+            elif class_name == "car" and det["confidence"] > 0.35:
+                danger = True
+                warning_text = "Achtung, ein Auto vor Ihnen."
+                break
+            elif class_name == "bus" and det["confidence"] > 0.35:
+                danger = True
+                warning_text = "Achtung, ein Bus vor Ihnen."
+                break
+            elif class_name == "truck" and det["confidence"] > 0.35:
+                danger = True
+                warning_text = "Achtung, ein Lastwagen vor Ihnen."
+                break
 
         # 保存带框图
         latest_annotated_frame = draw_detections(image, detections)
@@ -497,9 +491,15 @@ def detect():
         print(f"[DETECT] danger={danger}, warning_text={warning_text}")
 
         audio_url = ""
-        if danger and warning_class in DANGER_AUDIO_MAP:
-            filename = DANGER_AUDIO_MAP[warning_class]
-            audio_url = get_danger_audio_url(filename)
+
+        # 关键：危险提示也改走 TTS，不再使用 /audio/car.wav 这类本地文件
+        if danger and warning_text:
+            ok = generate_latest_tts_file(warning_text, voice="alloy", speed=1.5)
+            if ok:
+                audio_url = get_latest_audio_url()
+                print(f"[DETECT] ✅ 危险提示TTS已生成: {audio_url}")
+            else:
+                print("[DETECT] ❌ 危险提示TTS生成失败")
 
         return jsonify({
             "danger": danger,
@@ -514,7 +514,7 @@ def detect():
             "text": str(e),
             "audio_url": ""
         }), 500
-
+        
 @app.route("/ask_ai", methods=["POST"])
 def ask_ai():
     try:
