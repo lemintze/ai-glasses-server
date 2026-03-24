@@ -73,8 +73,8 @@ print("✓ 模型加载成功")
 
 DANGER_CLASS_MAP = {0: "person", 2: "car", 5: "bus", 7: "truck"}
 INPUT_SIZE = 640
-CONF_THRESHOLD = 0.45
-SCORE_THRESHOLD = 0.45
+CONF_THRESHOLD = 0.20
+SCORE_THRESHOLD = 0.20
 NMS_THRESHOLD = 0.45
 
 # ==========================
@@ -172,7 +172,7 @@ def detect_objects(image):
 
     return detections
 
-def generate_latest_tts_file(text, voice="alloy", speed=1.0):
+def generate_latest_tts_file(text, voice="alloy", speed=1.5):
     """
     直接向 OpenAI 请求 WAV，避免 pcm -> 手动封装 wav 造成兼容性问题
     """
@@ -410,7 +410,7 @@ def ask_ai():
         audio_url = ""
 
         if text:
-            ok = generate_latest_tts_file(text, voice="alloy", speed=1.0)
+            ok = generate_latest_tts_file(text, voice="alloy", speed=1.5)
             if ok:
                 audio_url = get_latest_audio_url()
                 print(f"[ASK_AI] ✅ 返回真实TTS音频: {audio_url}")
