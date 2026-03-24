@@ -1,12 +1,12 @@
 # ============================================================================
-# AI智能眼镜服务器 - HTTP版本（真实TTS + YOLO调试版）
+# AI智能眼镜服务器 - HTTP版本（真实TTS + YOLO调试修正版）
 # 功能：
 # 1. /ask_ai 使用真实图像理解 + 真实 TTS 生成
 # 2. TTS 直接请求 wav，speed=1.5
 # 3. /latest_audio.wav 使用更适合 ESP32 的完整 Response 返回
 # 4. /detect 保存最近原图、带框图、检测信息
 # 5. /debug/view 调试网页可查看原图、带框图、检测信息
-# 6. YOLO DEBUG 日志帮助判断是模型问题还是阈值/解析问题
+# 6. YOLO 输出解析兼容常见 ONNX 形状，避免 class_id 变成 8000+
 # ============================================================================
 
 import os
@@ -73,18 +73,28 @@ DANGER_AUDIO_MAP = {
 }
 
 # ==========================
+# COCO 类别名
+# ==========================
+COCO_CLASSES = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
+    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard",
+    "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+    "scissors", "teddy bear", "hair drier", "toothbrush"
+]
+
+DANGER_CLASS_NAMES = {"person", "car", "bus", "truck"}
+
+# ==========================
 # 加载模型
 # ==========================
 print("正在加载YOLO模型...")
 net = cv2.dnn.readNetFromONNX(MODEL_PATH)
 print("✓ 模型加载成功")
-
-DANGER_CLASS_MAP = {
-    0: "person",
-    2: "car",
-    5: "bus",
-    7: "truck"
-}
 
 INPUT_SIZE = 640
 
@@ -126,6 +136,55 @@ def letterbox(image, new_shape=(640, 640), color=(114, 114, 114)):
     )
     return image, r, dw, dh
 
+def normalize_predictions(outputs):
+    """
+    兼容常见 ONNX 输出：
+    - (1, N, 85)   YOLOv5 风格
+    - (1, 85, N)   需要转置
+    - (N, 85)
+    - (85, N)
+    - 84 维（YOLOv8 风格：4 box + 80 classes，无 obj_conf）
+    """
+    # OpenCV DNN 通常直接返回 ndarray，但保险起见兼容 list/tuple
+    if isinstance(outputs, (list, tuple)):
+        arr = outputs[0]
+    else:
+        arr = outputs
+
+    arr = np.array(arr)
+    print(f"[YOLO SHAPE] raw outputs.shape={arr.shape}")
+
+    # 去掉 batch 维
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+        print(f"[YOLO SHAPE] removed batch -> {arr.shape}")
+
+    # 现在希望变成 (N, C)
+    if arr.ndim == 2:
+        # 已经是 (N, 85) 或 (N, 84)
+        if arr.shape[1] in (84, 85):
+            preds = arr
+        # 是 (85, N) 或 (84, N)
+        elif arr.shape[0] in (84, 85):
+            preds = arr.transpose(1, 0)
+        else:
+            raise ValueError(f"无法识别的二维输出形状: {arr.shape}")
+    elif arr.ndim == 3:
+        # 某些模型可能还是三维
+        # 尝试最后一维是 84/85
+        if arr.shape[-1] in (84, 85):
+            preds = arr.reshape(-1, arr.shape[-1])
+        # 尝试第二维是 84/85
+        elif arr.shape[1] in (84, 85):
+            preds = arr.transpose(0, 2, 1).reshape(-1, arr.shape[1])
+        else:
+            raise ValueError(f"无法识别的三维输出形状: {arr.shape}")
+    else:
+        raise ValueError(f"不支持的输出维度: {arr.shape}")
+
+    print(f"[YOLO SHAPE] normalized predictions.shape={preds.shape}")
+    return preds
+
 def detect_objects(image):
     original = image.copy()
     h0, w0 = original.shape[:2]
@@ -141,7 +200,7 @@ def detect_objects(image):
 
     net.setInput(blob)
     outputs = net.forward()
-    predictions = outputs[0]
+    predictions = normalize_predictions(outputs)
 
     boxes, confidences, class_ids = [], [], []
 
@@ -149,28 +208,46 @@ def detect_objects(image):
     raw_count = 0
     passed_conf_count = 0
     passed_score_count = 0
-
-    # 新增：记录通过筛选的候选类别
     passed_candidates = []
+
+    pred_dim = predictions.shape[1]
+    is_yolov5_style = (pred_dim == 85)  # 4 + obj + 80
+    is_yolov8_style = (pred_dim == 84)  # 4 + 80，无 obj
+
+    if not (is_yolov5_style or is_yolov8_style):
+        print(f"[YOLO DEBUG] 非预期维度 pred_dim={pred_dim}")
+        return []
 
     for pred in predictions:
         raw_count += 1
 
-        obj_conf = float(pred[4])
-        if obj_conf < CONF_THRESHOLD:
-            continue
-        passed_conf_count += 1
+        if is_yolov5_style:
+            obj_conf = float(pred[4])
+            if obj_conf < CONF_THRESHOLD:
+                continue
+            passed_conf_count += 1
 
-        class_scores = pred[5:]
-        class_id = int(np.argmax(class_scores))
-        class_score = float(class_scores[class_id])
-        confidence = obj_conf * class_score
+            class_scores = pred[5:]
+            class_id = int(np.argmax(class_scores))
+            class_score = float(class_scores[class_id])
+            confidence = obj_conf * class_score
+
+        else:
+            # YOLOv8 风格：没有单独 obj_conf
+            obj_conf = 1.0
+            passed_conf_count += 1
+
+            class_scores = pred[4:]
+            class_id = int(np.argmax(class_scores))
+            class_score = float(class_scores[class_id])
+            confidence = class_score
 
         if confidence < SCORE_THRESHOLD:
             continue
         passed_score_count += 1
 
         cx, cy, w, h = pred[0:4]
+
         x = (cx - w / 2 - dw) / r
         y = (cy - h / 2 - dh) / r
         w = w / r
@@ -185,8 +262,11 @@ def detect_objects(image):
         confidences.append(float(confidence))
         class_ids.append(class_id)
 
+        class_name = COCO_CLASSES[class_id] if 0 <= class_id < len(COCO_CLASSES) else f"class_{class_id}"
+
         passed_candidates.append({
             "class_id": class_id,
+            "class_name": class_name,
             "class_score": round(class_score, 3),
             "confidence": round(confidence, 3),
             "box": [int(x), int(y), int(w), int(h)]
@@ -194,6 +274,10 @@ def detect_objects(image):
 
     print(f"[YOLO DEBUG] raw={raw_count}, passed_conf={passed_conf_count}, passed_score={passed_score_count}, boxes={len(boxes)}")
     print(f"[YOLO DEBUG] passed_candidates={passed_candidates}")
+
+    if len(boxes) == 0:
+        print("[YOLO DEBUG] boxes为空")
+        return []
 
     indices = cv2.dnn.NMSBoxes(boxes, confidences, SCORE_THRESHOLD, NMS_THRESHOLD)
     after_nms = len(indices) if len(indices) > 0 else 0
@@ -204,18 +288,21 @@ def detect_objects(image):
 
     if len(indices) > 0:
         for i in indices.flatten():
+            class_id = class_ids[i]
+            class_name = COCO_CLASSES[class_id] if 0 <= class_id < len(COCO_CLASSES) else f"class_{class_id}"
+
             kept = {
-                "class_id": class_ids[i],
+                "class_id": class_id,
+                "class_name": class_name,
                 "confidence": round(confidences[i], 3),
                 "box": boxes[i]
             }
             all_kept_after_nms.append(kept)
 
-            class_id = class_ids[i]
-            if class_id in DANGER_CLASS_MAP:
+            if class_name in DANGER_CLASS_NAMES:
                 detections.append({
                     "class_id": class_id,
-                    "class_name": DANGER_CLASS_MAP[class_id],
+                    "class_name": class_name,
                     "confidence": confidences[i],
                     "box": boxes[i]
                 })
@@ -372,7 +459,7 @@ def detect():
                 "position_ratio": round(position_ratio, 3)
             })
 
-            # 这里先保留你原来的危险判定逻辑
+            # 先保留你原来的危险判定逻辑
             if area_ratio > 0.08 and position_ratio > 0.5:
                 if class_name == "car":
                     danger = True
