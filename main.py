@@ -150,6 +150,9 @@ def detect_objects(image):
     passed_conf_count = 0
     passed_score_count = 0
 
+    # 新增：记录通过筛选的候选类别
+    passed_candidates = []
+
     for pred in predictions:
         raw_count += 1
 
@@ -182,15 +185,32 @@ def detect_objects(image):
         confidences.append(float(confidence))
         class_ids.append(class_id)
 
+        passed_candidates.append({
+            "class_id": class_id,
+            "class_score": round(class_score, 3),
+            "confidence": round(confidence, 3),
+            "box": [int(x), int(y), int(w), int(h)]
+        })
+
     print(f"[YOLO DEBUG] raw={raw_count}, passed_conf={passed_conf_count}, passed_score={passed_score_count}, boxes={len(boxes)}")
+    print(f"[YOLO DEBUG] passed_candidates={passed_candidates}")
 
     indices = cv2.dnn.NMSBoxes(boxes, confidences, SCORE_THRESHOLD, NMS_THRESHOLD)
     after_nms = len(indices) if len(indices) > 0 else 0
     print(f"[YOLO DEBUG] after_nms={after_nms}")
 
     detections = []
+    all_kept_after_nms = []
+
     if len(indices) > 0:
         for i in indices.flatten():
+            kept = {
+                "class_id": class_ids[i],
+                "confidence": round(confidences[i], 3),
+                "box": boxes[i]
+            }
+            all_kept_after_nms.append(kept)
+
             class_id = class_ids[i]
             if class_id in DANGER_CLASS_MAP:
                 detections.append({
@@ -200,7 +220,9 @@ def detect_objects(image):
                     "box": boxes[i]
                 })
 
+    print(f"[YOLO DEBUG] kept_after_nms={all_kept_after_nms}")
     print(f"[YOLO DEBUG] final_detections={detections}")
+
     return detections
 
 def draw_detections(image, detections):
