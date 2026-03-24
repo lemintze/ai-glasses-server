@@ -1,19 +1,28 @@
 # ============================================================================
-# AI智能眼镜服务器 - HTTP版本（真实TTS版）
-# 改进重点：
-# 1. /ask_ai 恢复为真实图像理解 + 真实 TTS 生成
-# 2. TTS 直接请求 wav，不走 pcm 手动封装
-# 3. latest_audio.wav 返回时禁缓存
-# 4. 增加详细日志，便于确认文本、文件大小、audio_url
+# AI智能眼镜服务器 - HTTP版本（真实TTS + YOLO调试版）
+# 功能：
+# 1. /ask_ai 使用真实图像理解 + 真实 TTS 生成
+# 2. TTS 直接请求 wav，speed=1.5
+# 3. /latest_audio.wav 使用更适合 ESP32 的完整 Response 返回
+# 4. /detect 保存最近原图、带框图、检测信息
+# 5. /debug/view 调试网页可查看原图、带框图、检测信息
+# 6. YOLO DEBUG 日志帮助判断是模型问题还是阈值/解析问题
 # ============================================================================
 
 import os
 import cv2
+import time
 import base64
 import numpy as np
-from flask import Flask, request, jsonify, send_file, send_from_directory, make_response, Response, render_template_string
+from flask import (
+    Flask,
+    request,
+    jsonify,
+    send_from_directory,
+    Response,
+    render_template_string
+)
 from openai import OpenAI
-import time
 
 app = Flask(__name__)
 
@@ -54,8 +63,7 @@ MODEL_PATH = os.path.join(BASE_DIR, "yolov5n.onnx")
 AUDIO_DIR = os.path.join(BASE_DIR, "audio")
 LATEST_AUDIO_PATH = os.path.join(BASE_DIR, "latest_audio.wav")
 
-for directory in [AUDIO_DIR]:
-    os.makedirs(directory, exist_ok=True)
+os.makedirs(AUDIO_DIR, exist_ok=True)
 
 DANGER_AUDIO_MAP = {
     "car": "car.wav",
@@ -71,8 +79,16 @@ print("正在加载YOLO模型...")
 net = cv2.dnn.readNetFromONNX(MODEL_PATH)
 print("✓ 模型加载成功")
 
-DANGER_CLASS_MAP = {0: "person", 2: "car", 5: "bus", 7: "truck"}
+DANGER_CLASS_MAP = {
+    0: "person",
+    2: "car",
+    5: "bus",
+    7: "truck"
+}
+
 INPUT_SIZE = 640
+
+# 先放宽阈值，优先验证“能不能看到人”
 CONF_THRESHOLD = 0.20
 SCORE_THRESHOLD = 0.20
 NMS_THRESHOLD = 0.45
@@ -89,6 +105,7 @@ def get_danger_audio_url(filename):
 def letterbox(image, new_shape=(640, 640), color=(114, 114, 114)):
     shape = image.shape[:2]
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+
     new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
     dw = new_shape[1] - new_unpad[0]
     dh = new_shape[0] - new_unpad[1]
@@ -128,10 +145,18 @@ def detect_objects(image):
 
     boxes, confidences, class_ids = [], [], []
 
+    # 调试计数器
+    raw_count = 0
+    passed_conf_count = 0
+    passed_score_count = 0
+
     for pred in predictions:
+        raw_count += 1
+
         obj_conf = float(pred[4])
         if obj_conf < CONF_THRESHOLD:
             continue
+        passed_conf_count += 1
 
         class_scores = pred[5:]
         class_id = int(np.argmax(class_scores))
@@ -140,6 +165,7 @@ def detect_objects(image):
 
         if confidence < SCORE_THRESHOLD:
             continue
+        passed_score_count += 1
 
         cx, cy, w, h = pred[0:4]
         x = (cx - w / 2 - dw) / r
@@ -156,7 +182,11 @@ def detect_objects(image):
         confidences.append(float(confidence))
         class_ids.append(class_id)
 
+    print(f"[YOLO DEBUG] raw={raw_count}, passed_conf={passed_conf_count}, passed_score={passed_score_count}, boxes={len(boxes)}")
+
     indices = cv2.dnn.NMSBoxes(boxes, confidences, SCORE_THRESHOLD, NMS_THRESHOLD)
+    after_nms = len(indices) if len(indices) > 0 else 0
+    print(f"[YOLO DEBUG] after_nms={after_nms}")
 
     detections = []
     if len(indices) > 0:
@@ -170,7 +200,30 @@ def detect_objects(image):
                     "box": boxes[i]
                 })
 
+    print(f"[YOLO DEBUG] final_detections={detections}")
     return detections
+
+def draw_detections(image, detections):
+    vis = image.copy()
+
+    for det in detections:
+        x, y, w, h = det["box"]
+        class_name = det["class_name"]
+        conf = det["confidence"]
+
+        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        label = f"{class_name} {conf:.2f}"
+        cv2.putText(
+            vis,
+            label,
+            (x, max(20, y - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2
+        )
+
+    return vis
 
 def generate_latest_tts_file(text, voice="alloy", speed=1.5):
     """
@@ -213,28 +266,6 @@ def generate_latest_tts_file(text, voice="alloy", speed=1.5):
     except Exception as e:
         print(f"[TTS] 错误：{e}")
         return False
-
-def draw_detections(image, detections):
-    vis = image.copy()
-
-    for det in detections:
-        x, y, w, h = det["box"]
-        class_name = det["class_name"]
-        conf = det["confidence"]
-
-        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        label = f"{class_name} {conf:.2f}"
-        cv2.putText(
-            vis,
-            label,
-            (x, max(20, y - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2
-        )
-
-    return vis
 
 # ==========================
 # HTTP 路由
@@ -305,6 +336,7 @@ def detect():
         for det in detections:
             class_name = det["class_name"]
             box = det["box"]
+
             box_area = box[2] * box[3]
             box_center_y = box[1] + box[3] / 2
             area_ratio = box_area / (img_width * img_height)
@@ -318,6 +350,7 @@ def detect():
                 "position_ratio": round(position_ratio, 3)
             })
 
+            # 这里先保留你原来的危险判定逻辑
             if area_ratio > 0.08 and position_ratio > 0.5:
                 if class_name == "car":
                     danger = True
@@ -438,12 +471,11 @@ def debug_raw_jpg():
     if latest_raw_frame is None:
         return jsonify({"error": "no raw frame yet"}), 404
 
-    ok, buf = cv2.imencode(".jpg", latest_raw_frame)
+    ok, buf = cv2.imencode(".jpg", latest_raw_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
     if not ok:
         return jsonify({"error": "encode failed"}), 500
 
     return Response(buf.tobytes(), mimetype="image/jpeg")
-
 
 @app.route("/debug/annotated.jpg")
 def debug_annotated_jpg():
@@ -452,12 +484,11 @@ def debug_annotated_jpg():
     if latest_annotated_frame is None:
         return jsonify({"error": "no annotated frame yet"}), 404
 
-    ok, buf = cv2.imencode(".jpg", latest_annotated_frame)
+    ok, buf = cv2.imencode(".jpg", latest_annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
     if not ok:
         return jsonify({"error": "encode failed"}), 500
 
     return Response(buf.tobytes(), mimetype="image/jpeg")
-
 
 @app.route("/debug/status")
 def debug_status():
@@ -517,7 +548,7 @@ def debug_view():
             }
 
             refreshDebug();
-            setInterval(refreshDebug, 1000);
+            setInterval(refreshDebug, 500);
         </script>
     </body>
     </html>
