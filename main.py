@@ -127,7 +127,7 @@ def get_latest_audio_url():
     return request.host_url.rstrip("/") + f"/latest_audio.wav?t={int(time.time()*1000)}"
 
 def get_danger_audio_url(filename):
-    return request.host_url.rstrip("/") + f"/audio/{filename}"
+    return request.host_url.rstrip("/") + f"/audio/{filename}?t={int(time.time()*1000)}"
 
 def letterbox(image, new_shape=(640, 640), color=(114, 114, 114)):
     shape = image.shape[:2]
