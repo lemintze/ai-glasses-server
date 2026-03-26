@@ -1,15 +1,23 @@
 # ============================================================================
-# AI智能眼镜服务器 - HTTP版本（唯一TTS文件稳定版）
-# 核心改动：
-# 1. 不再复用 latest_audio.wav
-# 2. 每次 TTS 生成唯一 wav 文件并返回唯一 URL
-# 3. 保留 debug 页面、YOLO 检测、真实 ask_ai
+# AI智能眼镜服务器 - HTTP版本（唯一TTS文件 + WAV规范化稳定版）
+# 功能：
+# 1. /ask_ai 使用真实图像理解 + 真实 TTS 生成
+# 2. /detect 使用 YOLO 检测危险，也走真实 TTS
+# 3. 每次 TTS 生成唯一 wav 文件，避免 latest_audio.wav 复用问题
+# 4. 对 OpenAI 返回的 wav 做重新规范化，提升 ESP32 播放兼容性
+# 5. danger 状态带短暂记忆，避免忽有忽无
+# 6. danger 播报带冷却，避免一直重复说话
+# 7. person 增加方向判断：links / direkt / rechts
+# 8. /debug/view 调试网页可查看原图、带框图、检测信息
 # ============================================================================
 
 import os
+import io
 import cv2
 import time
 import uuid
+import wave
+import audioop
 import base64
 import numpy as np
 from flask import (
@@ -111,9 +119,6 @@ NMS_THRESHOLD = 0.45
 # 辅助函数
 # ==========================
 def cleanup_old_tts_files(max_age_seconds: int = 600, keep_latest: int = 20):
-    """
-    清理旧的 TTS 文件，防止目录无限增长
-    """
     try:
         files = []
         for name in os.listdir(TTS_DIR):
@@ -244,7 +249,6 @@ def detect_objects(image):
             class_score = float(class_scores[class_id])
             confidence = obj_conf * class_score
         else:
-            obj_conf = 1.0
             passed_conf_count += 1
 
             class_scores = pred[4:]
@@ -342,9 +346,45 @@ def draw_detections(image, detections):
         )
     return vis
 
+def normalize_wav_bytes(wav_bytes: bytes, target_rate: int = 16000) -> bytes:
+    """
+    把输入 wav 重新规范化成：
+    - mono
+    - 16-bit
+    - target_rate Hz
+    - 干净的 PCM WAV 容器
+    """
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        framerate = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+
+    if channels == 2:
+        frames = audioop.tomono(frames, sampwidth, 1, 1)
+        channels = 1
+
+    if sampwidth != 2:
+        frames = audioop.lin2lin(frames, sampwidth, 2)
+        sampwidth = 2
+
+    if framerate != target_rate:
+        frames, _ = audioop.ratecv(frames, sampwidth, channels, framerate, target_rate, None)
+        framerate = target_rate
+
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(target_rate)
+        wf.writeframes(frames)
+
+    return out.getvalue()
+
 def generate_tts_file(text, voice="alloy", speed=1.5):
     """
-    每次生成唯一文件，避免复用 latest_audio.wav 带来的缓存/覆盖问题
+    每次生成唯一文件，并把 OpenAI 返回的 wav 重新规范化，
+    避免 ESP32 对某些 wav 头/采样率不兼容。
     返回: (ok, filename, url)
     """
     try:
@@ -359,16 +399,21 @@ def generate_tts_file(text, voice="alloy", speed=1.5):
             response_format="wav"
         )
 
-        wav_bytes = speech.content if speech and speech.content else b""
-        if not wav_bytes:
+        raw_wav_bytes = speech.content if speech and speech.content else b""
+        if not raw_wav_bytes:
             print("[TTS] ❌ 未收到音频内容")
             return False, "", ""
+
+        print(f"[TTS] 原始wav大小: {len(raw_wav_bytes)} bytes")
+
+        clean_wav_bytes = normalize_wav_bytes(raw_wav_bytes, target_rate=16000)
+        print(f"[TTS] 规范化后wav大小: {len(clean_wav_bytes)} bytes")
 
         filename = f"{uuid.uuid4().hex}.wav"
         filepath = os.path.join(TTS_DIR, filename)
 
         with open(filepath, "wb") as f:
-            f.write(wav_bytes)
+            f.write(clean_wav_bytes)
 
         if not os.path.exists(filepath):
             print("[TTS] ❌ 唯一TTS文件未成功写入")
@@ -487,7 +532,6 @@ def detect():
                 "direction": direction_text
             })
 
-            # person：更早提醒 + 方向
             if class_name == "person" and conf > 0.35 and area_ratio > 0.03:
                 danger = True
                 warning_class = "person"
@@ -517,7 +561,6 @@ def detect():
                 warning_text = "Achtung, ein Lastwagen vor Ihnen."
                 break
 
-        # 危险状态记忆
         if danger:
             last_danger_state = {
                 "active": True,
@@ -553,7 +596,6 @@ def detect():
 
         audio_url = ""
 
-        # 播报冷却
         if danger and warning_text:
             if now - last_alert_tts_time >= ALERT_COOLDOWN_SECONDS:
                 ok, _, url = generate_tts_file(warning_text, voice="alloy", speed=1.5)
