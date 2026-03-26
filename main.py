@@ -124,7 +124,7 @@ NMS_THRESHOLD = 0.45
 # 辅助函数
 # ==========================
 def get_latest_audio_url():
-    return request.host_url.rstrip("/") + "/latest_audio.wav"
+    return request.host_url.rstrip("/") + f"/latest_audio.wav?t={int(time.time()*1000)}"
 
 def get_danger_audio_url(filename):
     return request.host_url.rstrip("/") + f"/audio/{filename}"
