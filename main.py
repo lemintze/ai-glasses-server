@@ -1,17 +1,15 @@
 # ============================================================================
-# AI智能眼镜服务器 - HTTP版本（真实TTS + YOLO调试 + 稳定危险提醒版）
-# 功能：
-# 1. /ask_ai 使用真实图像理解 + 真实 TTS 生成
-# 2. /detect 使用 YOLO 检测危险，也走真实 TTS
-# 3. danger 状态带短暂记忆，避免忽有忽无
-# 4. danger 播报带冷却，避免一直重复说话
-# 5. person 增加方向判断：links / direkt / rechts
-# 6. /debug/view 调试网页可查看原图、带框图、检测信息
+# AI智能眼镜服务器 - HTTP版本（唯一TTS文件稳定版）
+# 核心改动：
+# 1. 不再复用 latest_audio.wav
+# 2. 每次 TTS 生成唯一 wav 文件并返回唯一 URL
+# 3. 保留 debug 页面、YOLO 检测、真实 ask_ai
 # ============================================================================
 
 import os
 import cv2
 import time
+import uuid
 import base64
 import numpy as np
 from flask import (
@@ -48,10 +46,7 @@ last_danger_state = {
     "timestamp": 0.0
 }
 
-# 危险状态保留时间（秒）
 DANGER_MEMORY_SECONDS = 1.0
-
-# 连续播报冷却时间（秒）
 ALERT_COOLDOWN_SECONDS = 3.0
 last_alert_tts_time = 0.0
 
@@ -78,16 +73,10 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "yolov5n.onnx")
 AUDIO_DIR = os.path.join(BASE_DIR, "audio")
-LATEST_AUDIO_PATH = os.path.join(BASE_DIR, "latest_audio.wav")
+TTS_DIR = os.path.join(BASE_DIR, "tts")
 
 os.makedirs(AUDIO_DIR, exist_ok=True)
-
-DANGER_AUDIO_MAP = {
-    "car": "car.wav",
-    "bus": "bus.wav",
-    "truck": "truck.wav",
-    "person": "person.wav",
-}
+os.makedirs(TTS_DIR, exist_ok=True)
 
 # ==========================
 # COCO 类别名
@@ -114,8 +103,6 @@ net = cv2.dnn.readNetFromONNX(MODEL_PATH)
 print("✓ 模型加载成功")
 
 INPUT_SIZE = 640
-
-# 先放宽阈值，优先验证“能不能看到人”
 CONF_THRESHOLD = 0.20
 SCORE_THRESHOLD = 0.20
 NMS_THRESHOLD = 0.45
@@ -123,11 +110,36 @@ NMS_THRESHOLD = 0.45
 # ==========================
 # 辅助函数
 # ==========================
-def get_latest_audio_url():
-    return request.host_url.rstrip("/") + f"/latest_audio.wav?t={int(time.time()*1000)}"
+def cleanup_old_tts_files(max_age_seconds: int = 600, keep_latest: int = 20):
+    """
+    清理旧的 TTS 文件，防止目录无限增长
+    """
+    try:
+        files = []
+        for name in os.listdir(TTS_DIR):
+            if name.endswith(".wav"):
+                path = os.path.join(TTS_DIR, name)
+                try:
+                    mtime = os.path.getmtime(path)
+                    files.append((path, mtime))
+                except Exception:
+                    pass
 
-def get_danger_audio_url(filename):
-    return request.host_url.rstrip("/") + f"/audio/{filename}?t={int(time.time()*1000)}"
+        files.sort(key=lambda x: x[1], reverse=True)
+
+        now = time.time()
+        for idx, (path, mtime) in enumerate(files):
+            if idx >= keep_latest or (now - mtime > max_age_seconds):
+                try:
+                    os.remove(path)
+                    print(f"[TTS CLEANUP] 删除旧文件: {os.path.basename(path)}")
+                except Exception as e:
+                    print(f"[TTS CLEANUP] 删除失败 {path}: {e}")
+    except Exception as e:
+        print(f"[TTS CLEANUP] 出错: {e}")
+
+def build_tts_url(filename: str):
+    return request.host_url.rstrip("/") + f"/tts/{filename}"
 
 def letterbox(image, new_shape=(640, 640), color=(114, 114, 114)):
     shape = image.shape[:2]
@@ -154,14 +166,6 @@ def letterbox(image, new_shape=(640, 640), color=(114, 114, 114)):
     return image, r, dw, dh
 
 def normalize_predictions(outputs):
-    """
-    兼容常见 ONNX 输出：
-    - (1, N, 85)   YOLOv5 风格
-    - (1, 85, N)   需要转置
-    - (N, 85)
-    - (85, N)
-    - 84 维（YOLOv8 风格：4 box + 80 classes，无 obj_conf）
-    """
     if isinstance(outputs, (list, tuple)):
         arr = outputs[0]
     else:
@@ -219,8 +223,8 @@ def detect_objects(image):
     passed_candidates = []
 
     pred_dim = predictions.shape[1]
-    is_yolov5_style = (pred_dim == 85)   # 4 + obj + 80
-    is_yolov8_style = (pred_dim == 84)   # 4 + 80
+    is_yolov5_style = (pred_dim == 85)
+    is_yolov8_style = (pred_dim == 84)
 
     if not (is_yolov5_style or is_yolov8_style):
         print(f"[YOLO DEBUG] 非预期维度 pred_dim={pred_dim}")
@@ -320,7 +324,6 @@ def detect_objects(image):
 
 def draw_detections(image, detections):
     vis = image.copy()
-
     for det in detections:
         x, y, w, h = det["box"]
         class_name = det["class_name"]
@@ -337,10 +340,13 @@ def draw_detections(image, detections):
             (0, 255, 0),
             2
         )
-
     return vis
 
-def generate_latest_tts_file(text, voice="alloy", speed=1.5):
+def generate_tts_file(text, voice="alloy", speed=1.5):
+    """
+    每次生成唯一文件，避免复用 latest_audio.wav 带来的缓存/覆盖问题
+    返回: (ok, filename, url)
+    """
     try:
         print(f"[TTS] 开始生成语音，文本前60字: {text[:60]}")
         print(f"[TTS] voice={voice}, speed={speed}, format=wav")
@@ -354,30 +360,34 @@ def generate_latest_tts_file(text, voice="alloy", speed=1.5):
         )
 
         wav_bytes = speech.content if speech and speech.content else b""
-
         if not wav_bytes:
             print("[TTS] ❌ 未收到音频内容")
-            return False
+            return False, "", ""
 
-        with open(LATEST_AUDIO_PATH, "wb") as f:
+        filename = f"{uuid.uuid4().hex}.wav"
+        filepath = os.path.join(TTS_DIR, filename)
+
+        with open(filepath, "wb") as f:
             f.write(wav_bytes)
 
-        if not os.path.exists(LATEST_AUDIO_PATH):
-            print("[TTS] ❌ latest_audio.wav 未成功写入")
-            return False
+        if not os.path.exists(filepath):
+            print("[TTS] ❌ 唯一TTS文件未成功写入")
+            return False, "", ""
 
-        file_size = os.path.getsize(LATEST_AUDIO_PATH)
-        print(f"[TTS] ✅ latest_audio.wav 已生成，大小: {file_size} bytes")
+        file_size = os.path.getsize(filepath)
+        print(f"[TTS] ✅ {filename} 已生成，大小: {file_size} bytes")
 
         if file_size < 100:
             print("[TTS] ❌ 音频文件过小，疑似无效")
-            return False
+            return False, "", ""
 
-        return True
+        cleanup_old_tts_files()
+        url = build_tts_url(filename)
+        return True, filename, url
 
     except Exception as e:
         print(f"[TTS] 错误：{e}")
-        return False
+        return False, "", ""
 
 def get_direction_text(box, img_width):
     x, y, w, h = box
@@ -394,17 +404,18 @@ def get_direction_text(box, img_width):
 # ==========================
 # HTTP 路由
 # ==========================
-@app.route("/latest_audio.wav", methods=["GET"])
-def latest_audio():
-    if not os.path.exists(LATEST_AUDIO_PATH):
-        return jsonify({"error": "latest audio not found"}), 404
+@app.route("/tts/<path:filename>", methods=["GET"])
+def serve_tts_file(filename):
+    path = os.path.join(TTS_DIR, filename)
+    if not os.path.exists(path):
+        return jsonify({"error": "tts file not found"}), 404
 
     try:
-        with open(LATEST_AUDIO_PATH, "rb") as f:
+        with open(path, "rb") as f:
             wav_data = f.read()
 
         file_size = len(wav_data)
-        print(f"[AUDIO] 提供 latest_audio.wav, 大小: {file_size} bytes")
+        print(f"[TTS FILE] 提供 {filename}, 大小: {file_size} bytes")
 
         response = Response(wav_data, mimetype="audio/wav")
         response.headers["Content-Length"] = str(file_size)
@@ -414,11 +425,10 @@ def latest_audio():
         response.headers["Expires"] = "0"
         response.headers["Connection"] = "close"
         response.headers["Accept-Ranges"] = "none"
-
         return response
 
     except Exception as e:
-        print(f"[AUDIO] 提供 latest_audio.wav 失败: {e}")
+        print(f"[TTS FILE] 提供 {filename} 失败: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/audio/<path:filename>", methods=["GET"])
@@ -432,7 +442,6 @@ def detect():
 
     try:
         img_bytes = request.get_data()
-
         if not img_bytes:
             return jsonify({"danger": False, "text": "", "audio_url": ""})
 
@@ -458,7 +467,6 @@ def detect():
         debug_detections = []
         now = time.time()
 
-        # 先根据当前帧检测判断危险
         for det in detections:
             class_name = det["class_name"]
             box = det["box"]
@@ -468,7 +476,6 @@ def detect():
             box_center_y = box[1] + box[3] / 2
             area_ratio = box_area / (img_width * img_height)
             position_ratio = box_center_y / img_height
-
             direction_text = get_direction_text(box, img_width)
 
             debug_detections.append({
@@ -480,7 +487,7 @@ def detect():
                 "direction": direction_text
             })
 
-            # person：提前到更远距离触发
+            # person：更早提醒 + 方向
             if class_name == "person" and conf > 0.35 and area_ratio > 0.03:
                 danger = True
                 warning_class = "person"
@@ -492,28 +499,25 @@ def detect():
                     warning_text = "Person direkt vor Ihnen."
                 break
 
-            # car / bus / truck 先保守一点
-            elif class_name == "car" and conf > 0.35 and area_ratio > 0.03:
+            elif class_name == "car" and conf > 0.40 and area_ratio > 0.06:
                 danger = True
                 warning_class = "car"
                 warning_text = "Achtung, ein Auto vor Ihnen."
                 break
 
-            elif class_name == "bus" and conf > 0.35 and area_ratio > 0.03:
+            elif class_name == "bus" and conf > 0.40 and area_ratio > 0.06:
                 danger = True
                 warning_class = "bus"
                 warning_text = "Achtung, ein Bus vor Ihnen."
                 break
 
-            elif class_name == "truck" and conf > 0.35 and area_ratio > 0.03:
+            elif class_name == "truck" and conf > 0.40 and area_ratio > 0.06:
                 danger = True
                 warning_class = "truck"
                 warning_text = "Achtung, ein Lastwagen vor Ihnen."
                 break
 
-        # ==========================
-        # 危险状态记忆（检测层稳定）
-        # ==========================
+        # 危险状态记忆
         if danger:
             last_danger_state = {
                 "active": True,
@@ -522,7 +526,6 @@ def detect():
                 "timestamp": now
             }
         else:
-            # 如果当前帧没检测到，但最近1秒检测到过，就保留危险状态
             if last_danger_state["active"] and (now - last_danger_state["timestamp"] <= DANGER_MEMORY_SECONDS):
                 danger = True
                 warning_class = last_danger_state["class_name"]
@@ -550,20 +553,19 @@ def detect():
 
         audio_url = ""
 
-        # ==========================
-        # 播报冷却（语音层克制）
-        # ==========================
+        # 播报冷却
         if danger and warning_text:
             if now - last_alert_tts_time >= ALERT_COOLDOWN_SECONDS:
-                ok = generate_latest_tts_file(warning_text, voice="alloy", speed=1.5)
+                ok, _, url = generate_tts_file(warning_text, voice="alloy", speed=1.5)
                 if ok:
-                    audio_url = get_latest_audio_url()
+                    audio_url = url
                     last_alert_tts_time = now
                     print(f"[DETECT] ✅ 危险提示TTS已生成: {audio_url}")
                 else:
                     print("[DETECT] ❌ 危险提示TTS生成失败")
             else:
-                print(f"[DETECT] ⏳ 仍在播报冷却中，剩余 {round(ALERT_COOLDOWN_SECONDS - (now - last_alert_tts_time), 2)} 秒")
+                remain = round(ALERT_COOLDOWN_SECONDS - (now - last_alert_tts_time), 2)
+                print(f"[DETECT] ⏳ 仍在播报冷却中，剩余 {remain} 秒")
 
         return jsonify({
             "danger": danger,
@@ -583,7 +585,6 @@ def detect():
 def ask_ai():
     try:
         img_bytes = request.get_data()
-
         if not img_bytes:
             return jsonify({"text": "Kein Bild empfangen.", "audio_url": ""}), 400
 
@@ -614,11 +615,10 @@ def ask_ai():
         print(f"[ASK_AI] 生成文本: {text}")
 
         audio_url = ""
-
         if text:
-            ok = generate_latest_tts_file(text, voice="alloy", speed=1.5)
+            ok, _, url = generate_tts_file(text, voice="alloy", speed=1.5)
             if ok:
-                audio_url = get_latest_audio_url()
+                audio_url = url
                 print(f"[ASK_AI] ✅ 返回真实TTS音频: {audio_url}")
             else:
                 print("[ASK_AI] ❌ TTS生成失败")
