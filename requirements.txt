@@ -9,3 +9,4 @@ opencv-python-headless==4.9.0.80
 python-dotenv==1.0.0
 websocket-client==1.7.0
 setuptools==68.0.0
+supabase
