@@ -135,6 +135,13 @@ NMS_THRESHOLD = 0.45
 # ==========================
 # 辅助函数
 # ==========================
+
+def rotate_image_if_needed(image):
+    """
+    将摄像头画面逆时针旋转 90°
+    """
+    return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    
 def cleanup_old_tts_files(max_age_seconds: int = 600, keep_latest: int = 20):
     try:
         files = []
@@ -550,6 +557,9 @@ def detect():
         npimg = np.frombuffer(img_bytes, np.uint8)
         image = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
 
+        if image is not None:
+            image = rotate_image_if_needed(image)
+
         if image is None:
             return jsonify({
                 "danger": False,
@@ -695,7 +705,22 @@ def ask_ai():
 
         print(f"[ASK_AI] 收到图片，大小: {len(img_bytes)} bytes")
 
-        base64_image = base64.b64encode(img_bytes).decode("utf-8")
+        npimg = np.frombuffer(img_bytes, np.uint8)
+        image = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+
+        if image is None:
+            return jsonify({"text": "Bild konnte nicht gelesen werden.", "audio_url": ""}), 400
+
+        # 🔥 关键：旋转
+        image = rotate_image_if_needed(image)
+
+        # 重新编码成 JPEG
+        ok, buf = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if not ok:
+            return jsonify({"text": "Bildkodierung fehlgeschlagen.", "audio_url": ""}), 500
+
+        rotated_bytes = buf.tobytes()
+        base64_image = base64.b64encode(rotated_bytes).decode("utf-8")
         image_url = f"data:image/jpeg;base64,{base64_image}"
 
         response = client.chat.completions.create(
