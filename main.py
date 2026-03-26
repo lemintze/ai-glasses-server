@@ -1,14 +1,16 @@
 # ============================================================================
-# AI智能眼镜服务器 - HTTP版本（唯一TTS文件 + WAV规范化稳定版）
+# AI智能眼镜服务器 - HTTP版本（Supabase TTS稳定版）
 # 功能：
 # 1. /ask_ai 使用真实图像理解 + 真实 TTS 生成
 # 2. /detect 使用 YOLO 检测危险，也走真实 TTS
 # 3. 每次 TTS 生成唯一 wav 文件，避免 latest_audio.wav 复用问题
 # 4. 对 OpenAI 返回的 wav 做重新规范化，提升 ESP32 播放兼容性
-# 5. danger 状态带短暂记忆，避免忽有忽无
-# 6. danger 播报带冷却，避免一直重复说话
-# 7. person 增加方向判断：links / direkt / rechts
-# 8. /debug/view 调试网页可查看原图、带框图、检测信息
+# 5. 生成后的 wav 自动上传到 Supabase Storage
+# 6. 返回 Supabase 公网音频链接给 ESP32，绕开 Railway /tts 流兼容问题
+# 7. danger 状态带短暂记忆，避免忽有忽无
+# 8. danger 播报带冷却，避免一直重复说话
+# 9. person 增加方向判断：links / direkt / rechts
+# 10. /debug/view 调试网页可查看原图、带框图、检测信息
 # ============================================================================
 
 import os
@@ -19,7 +21,9 @@ import uuid
 import wave
 import audioop
 import base64
+import mimetypes
 import numpy as np
+
 from flask import (
     Flask,
     request,
@@ -28,7 +32,9 @@ from flask import (
     Response,
     render_template_string
 )
+
 from openai import OpenAI
+from supabase import create_client
 
 app = Flask(__name__)
 
@@ -65,15 +71,26 @@ print("=" * 70)
 print("正在读取环境变量...")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "ai-files")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
 print(f"OPENAI_API_KEY: {'***' + OPENAI_API_KEY[-4:] if OPENAI_API_KEY else 'NOT SET'}")
+print(f"SUPABASE_URL: {SUPABASE_URL if SUPABASE_URL else 'NOT SET'}")
+print(f"SUPABASE_BUCKET: {SUPABASE_BUCKET}")
+print(f"SUPABASE_SERVICE_ROLE_KEY: {'***' + SUPABASE_SERVICE_ROLE_KEY[-4:] if SUPABASE_SERVICE_ROLE_KEY else 'NOT SET'}")
 
 if not OPENAI_API_KEY:
     raise ValueError("❌ OPENAI_API_KEY 环境变量未设置！")
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    raise ValueError("❌ SUPABASE_URL 或 SUPABASE_SERVICE_ROLE_KEY 未设置！")
 
 print("✓ 环境变量读取成功")
 print("=" * 70)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # ==========================
 # 路径配置
@@ -383,9 +400,8 @@ def normalize_wav_bytes(wav_bytes: bytes, target_rate: int = 16000) -> bytes:
 
 def generate_tts_file(text, voice="alloy", speed=1.5):
     """
-    每次生成唯一文件，并把 OpenAI 返回的 wav 重新规范化，
-    避免 ESP32 对某些 wav 头/采样率不兼容。
-    返回: (ok, filename, url)
+    每次生成唯一文件，并把 OpenAI 返回的 wav 重新规范化。
+    返回: (ok, filename, local_url)
     """
     try:
         print(f"[TTS] 开始生成语音，文本前60字: {text[:60]}")
@@ -427,12 +443,53 @@ def generate_tts_file(text, voice="alloy", speed=1.5):
             return False, "", ""
 
         cleanup_old_tts_files()
-        url = build_tts_url(filename)
-        return True, filename, url
+        local_url = build_tts_url(filename)
+        return True, filename, local_url
 
     except Exception as e:
         print(f"[TTS] 错误：{e}")
         return False, "", ""
+
+def upload_tts_to_supabase(filename: str):
+    """
+    把本地 TTS_DIR 里的 wav 上传到 Supabase Storage，返回公网 URL
+    """
+    try:
+        filepath = os.path.join(TTS_DIR, filename)
+        if not os.path.exists(filepath):
+            print(f"[SUPABASE] ❌ 文件不存在: {filepath}")
+            return False, ""
+
+        storage_path = f"tts/{filename}"
+
+        with open(filepath, "rb") as f:
+            file_data = f.read()
+
+        content_type = mimetypes.guess_type(filename)[0] or "audio/wav"
+
+        print(f"[SUPABASE] 开始上传: {storage_path}, 大小: {len(file_data)} bytes")
+
+        # 如文件已存在则先尝试删除，避免某些版本 SDK 对 upsert 不稳定
+        try:
+            supabase.storage.from_(SUPABASE_BUCKET).remove([storage_path])
+            print(f"[SUPABASE] 已尝试删除旧文件: {storage_path}")
+        except Exception:
+            pass
+
+        supabase.storage.from_(SUPABASE_BUCKET).upload(
+            path=storage_path,
+            file=file_data,
+            file_options={"content-type": content_type}
+        )
+
+        public_url = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(storage_path)
+
+        print(f"[SUPABASE] ✅ 上传成功: {public_url}")
+        return True, public_url
+
+    except Exception as e:
+        print(f"[SUPABASE] ❌ 上传失败: {e}")
+        return False, ""
 
 def get_direction_text(box, img_width):
     x, y, w, h = box
@@ -598,11 +655,17 @@ def detect():
 
         if danger and warning_text:
             if now - last_alert_tts_time >= ALERT_COOLDOWN_SECONDS:
-                ok, _, url = generate_tts_file(warning_text, voice="alloy", speed=1.5)
+                ok, filename, local_url = generate_tts_file(warning_text, voice="alloy", speed=1.5)
                 if ok:
-                    audio_url = url
-                    last_alert_tts_time = now
-                    print(f"[DETECT] ✅ 危险提示TTS已生成: {audio_url}")
+                    upload_ok, supabase_url = upload_tts_to_supabase(filename)
+                    if upload_ok:
+                        audio_url = supabase_url
+                        last_alert_tts_time = now
+                        print(f"[DETECT] ✅ 危险提示 Supabase TTS 已生成: {audio_url}")
+                    else:
+                        print("[DETECT] ❌ Supabase 上传失败，退回本地 Railway URL")
+                        audio_url = local_url
+                        last_alert_tts_time = now
                 else:
                     print("[DETECT] ❌ 危险提示TTS生成失败")
             else:
@@ -658,10 +721,15 @@ def ask_ai():
 
         audio_url = ""
         if text:
-            ok, _, url = generate_tts_file(text, voice="alloy", speed=1.5)
+            ok, filename, local_url = generate_tts_file(text, voice="alloy", speed=1.5)
             if ok:
-                audio_url = url
-                print(f"[ASK_AI] ✅ 返回真实TTS音频: {audio_url}")
+                upload_ok, supabase_url = upload_tts_to_supabase(filename)
+                if upload_ok:
+                    audio_url = supabase_url
+                    print(f"[ASK_AI] ✅ 返回 Supabase TTS 音频: {audio_url}")
+                else:
+                    print("[ASK_AI] ❌ Supabase 上传失败，退回本地 Railway URL")
+                    audio_url = local_url
             else:
                 print("[ASK_AI] ❌ TTS生成失败")
         else:
