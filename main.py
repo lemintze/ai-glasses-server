@@ -856,7 +856,7 @@ def debug_view():
             }
 
             refreshDebug();
-            setInterval(refreshDebug, 500);
+            setInterval(refreshDebug, 2000);
         </script>
     </body>
     </html>
